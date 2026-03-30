@@ -87,7 +87,7 @@ func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp
 		envCfg:     envCfg,
 		runtimeCfg: &atomic.Pointer[config.RuntimeConfig]{},
 	}
-	app.runtimeCfg.Store(loadRuntimeConfig(engine))
+	app.runtimeCfg.Store(loadRuntimeConfig(engine, envCfg))
 	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
 		return nil, err
 	}
@@ -307,6 +307,7 @@ func (a *resinApp) initObservability() error {
 		requestLogCfg.DBMaxBytes,
 		requestLogCfg.DBRetainCount,
 	)
+	a.requestlogRepo.SetTotalMaxBytes(int64(runtimeConfigSnapshot(a.runtimeCfg).RequestLogTotalMaxMB) * 1024 * 1024)
 	if err := a.requestlogRepo.Open(); err != nil {
 		return fmt.Errorf("requestlog repo open: %w", err)
 	}
@@ -366,6 +367,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		RuntimeCfg:     a.runtimeCfg,
 		EnvCfg:         a.envCfg,
 		Engine:         engine,
+		RequestLogRepo: a.requestlogRepo,
 		Pool:           a.topoRuntime.pool,
 		SubMgr:         a.topoRuntime.subManager,
 		Scheduler:      a.topoRuntime.scheduler,

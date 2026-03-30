@@ -94,7 +94,7 @@ func authVersionStartupWarning(authVersion config.AuthVersion) string {
 	)
 }
 
-func loadRuntimeConfig(engine *state.StateEngine) *config.RuntimeConfig {
+func loadRuntimeConfig(engine *state.StateEngine, envCfg *config.EnvConfig) *config.RuntimeConfig {
 	runtimeCfg, ver, err := engine.GetSystemConfig()
 	if err != nil {
 		fatalf("load system config: %v", err)
@@ -102,6 +102,14 @@ func loadRuntimeConfig(engine *state.StateEngine) *config.RuntimeConfig {
 	if runtimeCfg == nil {
 		log.Println("No persisted runtime config found, using defaults")
 		return config.NewDefaultRuntimeConfig()
+	}
+	runtimeCfg, changed := config.ApplyCompatibilityDefaults(runtimeCfg, envCfg)
+	if changed {
+		if err := engine.SaveSystemConfig(runtimeCfg, ver, time.Now().UnixNano()); err != nil {
+			startupWarnf("persist runtime config compatibility defaults failed: %v", err)
+		} else {
+			log.Printf("Backfilled persisted runtime config compatibility defaults (version %d)", ver)
+		}
 	}
 	log.Printf("Loaded persisted runtime config (version %d)", ver)
 	return runtimeCfg

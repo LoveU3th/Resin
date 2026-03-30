@@ -17,6 +17,7 @@ import type { RuntimeConfig, RuntimeConfigPatch } from "./types";
 type RuntimeConfigForm = {
   user_agent: string;
   request_log_enabled: boolean;
+  request_log_total_max_mb: string;
   reverse_proxy_log_detail_enabled: boolean;
   reverse_proxy_log_req_headers_max_bytes: string;
   reverse_proxy_log_req_body_max_bytes: string;
@@ -37,6 +38,7 @@ type RuntimeConfigForm = {
 const EDITABLE_FIELDS: Array<keyof RuntimeConfig> = [
   "user_agent",
   "request_log_enabled",
+  "request_log_total_max_mb",
   "reverse_proxy_log_detail_enabled",
   "reverse_proxy_log_req_headers_max_bytes",
   "reverse_proxy_log_req_body_max_bytes",
@@ -57,6 +59,7 @@ const EDITABLE_FIELDS: Array<keyof RuntimeConfig> = [
 const FIELD_LABELS: Record<keyof RuntimeConfig, string> = {
   user_agent: "User-Agent",
   request_log_enabled: "启用请求日志",
+  request_log_total_max_mb: "日志总大小限制 (MB)",
   reverse_proxy_log_detail_enabled: "记录详细反代日志",
   reverse_proxy_log_req_headers_max_bytes: "请求头最大字节数",
   reverse_proxy_log_req_body_max_bytes: "请求体最大字节数",
@@ -95,6 +98,7 @@ function configToForm(config: RuntimeConfig): RuntimeConfigForm {
   return {
     user_agent: config.user_agent,
     request_log_enabled: config.request_log_enabled,
+    request_log_total_max_mb: String(config.request_log_total_max_mb),
     reverse_proxy_log_detail_enabled: config.reverse_proxy_log_detail_enabled,
     reverse_proxy_log_req_headers_max_bytes: String(config.reverse_proxy_log_req_headers_max_bytes),
     reverse_proxy_log_req_body_max_bytes: String(config.reverse_proxy_log_req_body_max_bytes),
@@ -125,6 +129,18 @@ function parseNonNegativeInt(field: string, raw: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(i18next.t("{{field}} 必须是非负整数", { field: requiredFieldLabel(field) }));
+  }
+  return parsed;
+}
+
+function parsePositiveInt(field: string, raw: string): number {
+  const value = raw.trim();
+  if (!value) {
+    throw new Error(i18next.t("{{field}} 不能为空", { field: requiredFieldLabel(field) }));
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(i18next.t("{{field}} 必须是正整数", { field: requiredFieldLabel(field) }));
   }
   return parsed;
 }
@@ -163,6 +179,7 @@ function parseForm(form: RuntimeConfigForm): RuntimeConfig {
   return {
     user_agent: userAgent,
     request_log_enabled: form.request_log_enabled,
+    request_log_total_max_mb: parsePositiveInt("日志总大小限制 (MB)", form.request_log_total_max_mb),
     reverse_proxy_log_detail_enabled: form.reverse_proxy_log_detail_enabled,
     reverse_proxy_log_req_headers_max_bytes: parseNonNegativeInt(
       "请求头最大字节数",
@@ -528,6 +545,22 @@ export function SystemConfigPage() {
                 </div>
 
                 <div className="form-grid" style={{ marginTop: "16px" }}>
+                  <div className="field-group">
+                    <div style={{ display: "flex", alignItems: "center" }}>
+                      <label className="field-label" htmlFor="sys-log-total-max" style={{ margin: 0 }}>
+                        {t("日志总大小限制 (MB)")}
+                      </label>
+                      {renderRestoreButton("request_log_total_max_mb")}
+                    </div>
+                    <Input
+                      id="sys-log-total-max"
+                      type="number"
+                      min={1}
+                      value={form.request_log_total_max_mb}
+                      onChange={(event) => setFormField("request_log_total_max_mb", event.target.value)}
+                    />
+                  </div>
+
                   <div className="field-group">
                     <div style={{ display: "flex", alignItems: "center" }}>
                       <label className="field-label" htmlFor="sys-req-h-max" style={{ margin: 0 }}>

@@ -438,6 +438,117 @@ func TestRepo_MaybeRotateCountsWalAndShmSize(t *testing.T) {
 	}
 }
 
+func TestRepo_SetTotalMaxBytes_RotatesAndCleansImmediately(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1024, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	if err := os.WriteFile(repo.activePath+"-wal", make([]byte, 1500), 0o644); err != nil {
+		t.Fatalf("write wal: %v", err)
+	}
+
+	before := repo.activePath
+	repo.SetTotalMaxBytes(512)
+	if repo.activePath == before {
+		t.Fatal("expected active db to rotate after reducing total max bytes")
+	}
+
+	files, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("listDBFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("db file count: got %d, want 1", len(files))
+	}
+	if files[0] != repo.activePath {
+		t.Fatalf("remaining db should be active path: files=%v active=%q", files, repo.activePath)
+	}
+}
+
+func TestRepo_CleanupEnforcesTotalMaxBytesAcrossShards(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	first := repo.activePath
+	if err := os.WriteFile(first+"-wal", make([]byte, 1100), 0o644); err != nil {
+		t.Fatalf("write first wal: %v", err)
+	}
+
+	if err := repo.rotateDB(); err != nil {
+		t.Fatalf("rotateDB first: %v", err)
+	}
+	second := repo.activePath
+	if err := os.WriteFile(second+"-wal", make([]byte, 1100), 0o644); err != nil {
+		t.Fatalf("write second wal: %v", err)
+	}
+
+	if err := repo.rotateDB(); err != nil {
+		t.Fatalf("rotateDB second: %v", err)
+	}
+	third := repo.activePath
+
+	secondSize, err := sqliteFilesSize(second)
+	if err != nil {
+		t.Fatalf("sqliteFilesSize(second): %v", err)
+	}
+	thirdSize, err := sqliteFilesSize(third)
+	if err != nil {
+		t.Fatalf("sqliteFilesSize(third): %v", err)
+	}
+	limit := secondSize + thirdSize + 1024
+
+	repo.SetTotalMaxBytes(limit)
+
+	files, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("listDBFiles: %v", err)
+	}
+	if len(files) == 0 || len(files) >= 3 {
+		t.Fatalf("db file count after cleanup: got %d, want 1 or 2", len(files))
+	}
+	for _, file := range files {
+		if file == first {
+			t.Fatalf("oldest shard should have been deleted: files=%v", files)
+		}
+	}
+
+	totalSize, err := totalDBFilesSize(files)
+	if err != nil {
+		t.Fatalf("totalDBFilesSize: %v", err)
+	}
+	if totalSize > limit {
+		t.Fatalf("total size after cleanup: got %d, want <= %d", totalSize, limit)
+	}
+}
+
+func TestRepo_RetainCountStillLimitsShardCount(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 2)
+	if err := repo.Open(); err != nil {
+		t.Fatalf("repo.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	if err := repo.rotateDB(); err != nil {
+		t.Fatalf("rotateDB first: %v", err)
+	}
+	if err := repo.rotateDB(); err != nil {
+		t.Fatalf("rotateDB second: %v", err)
+	}
+
+	files, err := repo.listDBFiles()
+	if err != nil {
+		t.Fatalf("listDBFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("db file count: got %d, want 2", len(files))
+	}
+}
+
 func TestRepo_InsertBatchRecoversAfterActiveDBLost(t *testing.T) {
 	repo := NewRepo(t.TempDir(), 1<<20, 5)
 	if err := repo.Open(); err != nil {
@@ -490,4 +601,16 @@ func TestRepo_InsertBatchWithoutOpenReturnsNoActiveDB(t *testing.T) {
 	if !strings.Contains(err.Error(), "no active db") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+func totalDBFilesSize(files []string) (int64, error) {
+	var total int64
+	for _, file := range files {
+		size, err := sqliteFilesSize(file)
+		if err != nil {
+			return 0, err
+		}
+		total += size
+	}
+	return total, nil
 }

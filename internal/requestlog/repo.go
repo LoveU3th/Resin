@@ -23,9 +23,11 @@ const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, 
 // Repo manages rolling SQLite databases for request logs.
 // Each DB is named request_logs-<unix_ms>.db and lives in logDir.
 type Repo struct {
-	logDir      string
-	maxBytes    int64
-	retainCount int
+	mu            sync.Mutex
+	logDir        string
+	maxBytes      int64
+	totalMaxBytes int64
+	retainCount   int
 
 	// Active DB handle and path.
 	activeDB   *sql.DB
@@ -47,9 +49,10 @@ func NewRepo(logDir string, maxBytes int64, retainCount int) *Repo {
 		retainCount = 5
 	}
 	return &Repo{
-		logDir:      logDir,
-		maxBytes:    maxBytes,
-		retainCount: retainCount,
+		logDir:        logDir,
+		maxBytes:      maxBytes,
+		totalMaxBytes: maxBytes * int64(retainCount),
+		retainCount:   retainCount,
 	}
 }
 
@@ -57,6 +60,9 @@ func NewRepo(logDir string, maxBytes int64, retainCount int) *Repo {
 // If a previous DB exists in the directory it is reused as active;
 // a new one is created only when no existing DB is found.
 func (r *Repo) Open() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if err := os.MkdirAll(r.logDir, 0o755); err != nil {
 		return fmt.Errorf("requestlog repo mkdir %s: %w", r.logDir, err)
 	}
@@ -73,13 +79,16 @@ func (r *Repo) Open() error {
 			return err
 		}
 		// DESIGN.md §576: prune old files on startup.
-		return r.cleanup()
+		return r.enforceLimitsLocked()
 	}
-	return r.rotateDB()
+	return r.rotateDBLocked()
 }
 
 // Close closes the active DB.
 func (r *Repo) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.activeDB != nil {
 		err := r.activeDB.Close()
 		r.activeDB = nil
@@ -92,6 +101,9 @@ func (r *Repo) Close() error {
 // InsertBatch inserts a batch of log entries + optional payloads in a single
 // transaction. Returns the number of rows successfully inserted.
 func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if r.activeDB == nil {
 		if err := r.recoverActiveDB(); err != nil {
 			return 0, err
@@ -99,7 +111,7 @@ func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
 	}
 
 	// Check if rotation is needed before insert.
-	if err := r.maybeRotate(); err != nil {
+	if err := r.maybeRotateLocked(); err != nil {
 		return 0, fmt.Errorf("requestlog repo rotate: %w", err)
 	}
 
@@ -191,7 +203,7 @@ func (r *Repo) recoverActiveDB() error {
 	if r.activePath == "" {
 		return fmt.Errorf("requestlog repo: no active db")
 	}
-	if err := r.rotateDB(); err != nil {
+	if err := r.rotateDBLocked(); err != nil {
 		return fmt.Errorf("requestlog repo recover active db: %w", err)
 	}
 	return nil
@@ -409,6 +421,24 @@ func (r *Repo) setReadBarrier(fn func()) {
 	r.readBarrierMu.Unlock()
 }
 
+// SetTotalMaxBytes updates the runtime total capacity limit for request logs.
+// The new limit takes effect immediately for subsequent rotations and cleanup.
+func (r *Repo) SetTotalMaxBytes(totalMaxBytes int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if totalMaxBytes <= 0 {
+		totalMaxBytes = r.maxBytes * int64(r.retainCount)
+	}
+	r.totalMaxBytes = totalMaxBytes
+	if r.activeDB == nil && r.activePath == "" {
+		return
+	}
+	if err := r.enforceLimitsLocked(); err != nil {
+		log.Printf("[requestlog] warning: apply total size limit failed: %v", err)
+	}
+}
+
 func (r *Repo) runReadBarrier() {
 	r.readBarrierMu.RLock()
 	barrier := r.readBarrier
@@ -435,6 +465,12 @@ func (r *Repo) openDB(path string) error {
 }
 
 func (r *Repo) rotateDB() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rotateDBLocked()
+}
+
+func (r *Repo) rotateDBLocked() error {
 	if r.activeDB != nil {
 		r.activeDB.Close()
 		r.activeDB = nil
@@ -444,41 +480,100 @@ func (r *Repo) rotateDB() error {
 	if err := r.openDB(path); err != nil {
 		return fmt.Errorf("requestlog rotate: %w", err)
 	}
-	return r.cleanup()
+	return r.cleanupLocked()
 }
 
 func (r *Repo) maybeRotate() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maybeRotateLocked()
+}
+
+func (r *Repo) maybeRotateLocked() error {
 	if r.activePath == "" {
-		return r.rotateDB()
+		return r.rotateDBLocked()
 	}
 	totalSize, err := sqliteFilesSize(r.activePath)
 	if err != nil {
 		log.Printf("[requestlog] warning: stat active db failed path=%q: %v", r.activePath, err)
 		return nil // can't stat; skip rotation check
 	}
-	if totalSize >= r.maxBytes {
-		return r.rotateDB()
+	if totalSize >= r.activeRotateThresholdBytes() {
+		return r.rotateDBLocked()
 	}
 	return nil
 }
 
 func (r *Repo) cleanup() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cleanupLocked()
+}
+
+func (r *Repo) cleanupLocked() error {
 	files, err := r.listDBFiles()
 	if err != nil {
 		return err
 	}
-	// Keep retainCount most recent files (the active one is always latest).
-	if len(files) <= r.retainCount {
-		return nil
+
+	totalBytes := int64(0)
+	fileSizes := make(map[string]int64, len(files))
+	for _, f := range files {
+		size, sizeErr := sqliteFilesSize(f)
+		if sizeErr != nil {
+			return sizeErr
+		}
+		fileSizes[f] = size
+		totalBytes += size
 	}
-	toRemove := files[:len(files)-r.retainCount]
-	for _, f := range toRemove {
+
+	for len(files) > 0 {
+		exceedsRetainCount := len(files) > r.retainCount
+		exceedsTotalMax := r.totalMaxBytes > 0 && totalBytes > r.totalMaxBytes
+		if !exceedsRetainCount && !exceedsTotalMax {
+			break
+		}
+
+		candidate := files[0]
+		if candidate == r.activePath {
+			break
+		}
+		totalBytes -= fileSizes[candidate]
+		files = files[1:]
+
+		f := candidate
 		os.Remove(f)
 		// Also clean up WAL/SHM files.
 		os.Remove(f + "-wal")
 		os.Remove(f + "-shm")
 	}
 	return nil
+}
+
+func (r *Repo) activeRotateThresholdBytes() int64 {
+	threshold := r.maxBytes
+	if r.totalMaxBytes > 0 && (threshold <= 0 || r.totalMaxBytes < threshold) {
+		threshold = r.totalMaxBytes
+	}
+	if threshold <= 0 {
+		threshold = r.maxBytes
+	}
+	return threshold
+}
+
+func (r *Repo) enforceLimitsLocked() error {
+	if r.activePath != "" {
+		activeSize, err := sqliteFilesSize(r.activePath)
+		if err != nil {
+			log.Printf("[requestlog] warning: stat active db failed path=%q: %v", r.activePath, err)
+		} else if activeSize >= r.activeRotateThresholdBytes() {
+			if err := r.rotateDBLocked(); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	return r.cleanupLocked()
 }
 
 func (r *Repo) listDBFiles() ([]string, error) {
