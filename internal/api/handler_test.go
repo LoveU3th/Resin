@@ -41,8 +41,8 @@ func newTestServer() *Server {
 		RequestLogQueueSize:                             8192,
 		RequestLogQueueFlushBatchSize:                   4096,
 		RequestLogQueueFlushInterval:                    5 * time.Minute,
-		RequestLogDBMaxMB:                               512,
-		RequestLogDBRetainCount:                         5,
+		RequestLogDBMaxMB:                               100,
+		RequestLogDBRetainCount:                         2,
 		AdminToken:                                      "test-admin-token",
 		ProxyToken:                                      "test-proxy-token",
 		MetricThroughputIntervalSeconds:                 1,
@@ -229,6 +229,9 @@ func TestSystemConfig_OK(t *testing.T) {
 	if body["request_log_enabled"] != true {
 		t.Errorf("request_log_enabled: got %v, want true", body["request_log_enabled"])
 	}
+	if body["request_log_total_max_mb"] != float64(200) {
+		t.Errorf("request_log_total_max_mb: got %v, want 200", body["request_log_total_max_mb"])
+	}
 
 	// JSON numbers are float64
 	if maxFail, ok := body["max_consecutive_failures"].(float64); !ok || maxFail != 3 {
@@ -374,6 +377,9 @@ func TestSystemDefaultConfig_OK(t *testing.T) {
 
 	if body["request_log_enabled"] != true {
 		t.Errorf("request_log_enabled: got %v, want true", body["request_log_enabled"])
+	}
+	if body["request_log_total_max_mb"] != float64(200) {
+		t.Errorf("request_log_total_max_mb: got %v, want 200", body["request_log_total_max_mb"])
 	}
 	if maxFail, ok := body["max_consecutive_failures"].(float64); !ok || maxFail != 3 {
 		t.Errorf("max_consecutive_failures: got %v, want 3", body["max_consecutive_failures"])

@@ -12,6 +12,9 @@ func TestNewDefaultRuntimeConfig(t *testing.T) {
 	if cfg.RequestLogEnabled != true {
 		t.Errorf("RequestLogEnabled: got %v, want true", cfg.RequestLogEnabled)
 	}
+	if cfg.RequestLogTotalMaxMB != 200 {
+		t.Errorf("RequestLogTotalMaxMB: got %d, want 200", cfg.RequestLogTotalMaxMB)
+	}
 	if cfg.MaxConsecutiveFailures != 3 {
 		t.Errorf("MaxConsecutiveFailures: got %d, want 3", cfg.MaxConsecutiveFailures)
 	}
@@ -75,6 +78,31 @@ func TestDuration_JSONInvalid(t *testing.T) {
 	}
 }
 
+func TestApplyCompatibilityDefaults_BackfillsRequestLogTotalFromEnv(t *testing.T) {
+	cfg := &RuntimeConfig{
+		UserAgent:          "compat-test",
+		RequestLogEnabled:  true,
+		LatencyAuthorities: []string{"example.com"},
+	}
+
+	got, changed := ApplyCompatibilityDefaults(cfg, &EnvConfig{
+		RequestLogDBMaxMB:       100,
+		RequestLogDBRetainCount: 2,
+	})
+	if !changed {
+		t.Fatal("expected compatibility defaults to report changes")
+	}
+	if got.RequestLogTotalMaxMB != 200 {
+		t.Fatalf("RequestLogTotalMaxMB: got %d, want 200", got.RequestLogTotalMaxMB)
+	}
+	if got.UserAgent != "compat-test" {
+		t.Fatalf("UserAgent changed unexpectedly: %q", got.UserAgent)
+	}
+	if len(got.LatencyAuthorities) != 1 || got.LatencyAuthorities[0] != "example.com" {
+		t.Fatalf("LatencyAuthorities changed unexpectedly: %+v", got.LatencyAuthorities)
+	}
+}
+
 func TestRuntimeConfig_JSONFieldNames(t *testing.T) {
 	cfg := NewDefaultRuntimeConfig()
 	data, err := json.Marshal(cfg)
@@ -90,6 +118,7 @@ func TestRuntimeConfig_JSONFieldNames(t *testing.T) {
 	// Check that JSON keys match the DESIGN.md GET /system/config response
 	expectedKeys := []string{
 		"request_log_enabled",
+		"request_log_total_max_mb",
 		"reverse_proxy_log_detail_enabled",
 		"reverse_proxy_log_req_headers_max_bytes",
 		"reverse_proxy_log_req_body_max_bytes",

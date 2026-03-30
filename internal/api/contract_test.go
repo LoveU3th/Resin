@@ -990,6 +990,7 @@ func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {
 
 	rec := doJSONRequest(t, srv, http.MethodPatch, "/api/v1/system/config", map[string]any{
 		"request_log_enabled":                     true,
+		"request_log_total_max_mb":                150,
 		"reverse_proxy_log_req_headers_max_bytes": 2048,
 		"p2c_latency_window":                      "7m",
 		"cache_flush_interval":                    "30s",
@@ -1001,6 +1002,9 @@ func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {
 	body := decodeJSONMap(t, rec)
 	if body["request_log_enabled"] != true {
 		t.Fatalf("request_log_enabled: got %v, want true", body["request_log_enabled"])
+	}
+	if body["request_log_total_max_mb"] != float64(150) {
+		t.Fatalf("request_log_total_max_mb: got %v", body["request_log_total_max_mb"])
 	}
 	if body["reverse_proxy_log_req_headers_max_bytes"] != float64(2048) {
 		t.Fatalf("reverse_proxy_log_req_headers_max_bytes: got %v", body["reverse_proxy_log_req_headers_max_bytes"])
@@ -1016,6 +1020,9 @@ func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {
 	if !snap.RequestLogEnabled {
 		t.Fatal("runtime pointer did not reflect patched request_log_enabled")
 	}
+	if snap.RequestLogTotalMaxMB != 150 {
+		t.Fatalf("runtime pointer request_log_total_max_mb=%d, want 150", snap.RequestLogTotalMaxMB)
+	}
 	if snap.ReverseProxyLogReqHeadersMaxBytes != 2048 {
 		t.Fatalf("runtime pointer reverse_proxy_log_req_headers_max_bytes=%d, want 2048", snap.ReverseProxyLogReqHeadersMaxBytes)
 	}
@@ -1028,6 +1035,7 @@ func TestAPIContract_SystemConfigPatchSemantics(t *testing.T) {
 		{name: "unknown field", body: map[string]any{"unknown_field": 1}},
 		{name: "removed field", body: map[string]any{"ephemeral_node_evict_delay": "1h"}},
 		{name: "null value", body: map[string]any{"request_log_enabled": nil}},
+		{name: "zero request_log_total_max_mb", body: map[string]any{"request_log_total_max_mb": 0}},
 		{name: "empty latency_test_url", body: map[string]any{"latency_test_url": ""}},
 	}
 	for _, tc := range cases {
@@ -1060,6 +1068,9 @@ func TestAPIContract_SystemDefaultConfigSnapshot(t *testing.T) {
 	if defaultBody["request_log_enabled"] != true {
 		t.Fatalf("default request_log_enabled: got %v, want true", defaultBody["request_log_enabled"])
 	}
+	if defaultBody["request_log_total_max_mb"] != float64(200) {
+		t.Fatalf("default request_log_total_max_mb: got %v, want 200", defaultBody["request_log_total_max_mb"])
+	}
 	if defaultBody["max_consecutive_failures"] != float64(3) {
 		t.Fatalf("default max_consecutive_failures: got %v, want 3", defaultBody["max_consecutive_failures"])
 	}
@@ -1071,6 +1082,9 @@ func TestAPIContract_SystemDefaultConfigSnapshot(t *testing.T) {
 	currentBody := decodeJSONMap(t, currentRec)
 	if currentBody["request_log_enabled"] != true {
 		t.Fatalf("current request_log_enabled: got %v, want true", currentBody["request_log_enabled"])
+	}
+	if currentBody["request_log_total_max_mb"] != float64(200) {
+		t.Fatalf("current request_log_total_max_mb: got %v, want 200", currentBody["request_log_total_max_mb"])
 	}
 	if currentBody["max_consecutive_failures"] != float64(9) {
 		t.Fatalf("current max_consecutive_failures: got %v, want 9", currentBody["max_consecutive_failures"])
