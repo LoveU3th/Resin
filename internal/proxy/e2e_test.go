@@ -764,6 +764,63 @@ func TestForwardProxy_CONNECTClientCanceledBeforeResponse(t *testing.T) {
 	}
 }
 
+func TestForwardProxy_CONNECTResponseFlushFailureDoesNotPenalizeNode(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	emitter := newMockEventEmitter()
+	health := &mockHealthRecorder{}
+
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer upstreamPeer.Close()
+
+	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return upstreamConn, nil
+	})
+
+	fp := NewForwardProxy(ForwardProxyConfig{
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     health,
+		Events:     emitter,
+	})
+
+	req := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
+	req.Host = "example.com:443"
+	req.Header.Set("Proxy-Authorization", basicAuth("tok", "plat"))
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	failingConn := &failOnWriteConn{Conn: serverConn, failAt: 1}
+	w := &hijackTestResponseWriter{
+		conn: failingConn,
+		rw:   bufio.NewReadWriter(bufio.NewReader(failingConn), bufio.NewWriter(failingConn)),
+	}
+
+	fp.ServeHTTP(w, req)
+
+	select {
+	case logEv := <-emitter.logCh:
+		if !logEv.NetOK {
+			t.Fatal("CONNECT response flush failure should log net_ok=true")
+		}
+		if logEv.ResinError != "" {
+			t.Fatalf("ResinError: got %q, want empty", logEv.ResinError)
+		}
+		if logEv.UpstreamStage != "connect_client_response_flush" {
+			t.Fatalf("UpstreamStage: got %q, want %q", logEv.UpstreamStage, "connect_client_response_flush")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected CONNECT log event")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if health.resultCalls.Load() != 0 {
+		t.Fatalf("CONNECT response flush failure should not record health result, got %d calls", health.resultCalls.Load())
+	}
+}
+
 func TestForwardProxy_CONNECTZeroTrafficMarkedFailed(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	emitter := newMockEventEmitter()
