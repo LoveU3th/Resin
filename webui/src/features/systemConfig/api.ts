@@ -5,6 +5,7 @@ const path = "/api/v1/system/config";
 
 const DEFAULT_CONFIG: RuntimeConfig = {
   request_log_enabled: true,
+  request_log_total_max_mb: 200,
   reverse_proxy_log_detail_enabled: false,
   reverse_proxy_log_req_headers_max_bytes: 0,
   reverse_proxy_log_req_body_max_bytes: 0,
@@ -44,6 +45,7 @@ function normalizeRuntimeConfig(raw: Partial<RuntimeConfig> | null | undefined):
 
   return {
     request_log_enabled: Boolean(raw.request_log_enabled),
+    request_log_total_max_mb: asNumber(raw.request_log_total_max_mb, DEFAULT_CONFIG.request_log_total_max_mb),
     reverse_proxy_log_detail_enabled: Boolean(raw.reverse_proxy_log_detail_enabled),
     reverse_proxy_log_req_headers_max_bytes: asNumber(
       raw.reverse_proxy_log_req_headers_max_bytes,

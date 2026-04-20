@@ -60,9 +60,14 @@ type ControlPlaneService struct {
 	MatcherRuntime *proxy.AccountMatcherRuntime
 	RuntimeCfg     *atomic.Pointer[config.RuntimeConfig]
 	EnvCfg         *config.EnvConfig
+	RequestLogRepo requestLogConfigApplier
 
 	configMu      sync.Mutex
 	configVersion int
+}
+
+type requestLogConfigApplier interface {
+	SetTotalMaxBytes(totalMaxBytes int64)
 }
 
 // ------------------------------------------------------------------
@@ -72,6 +77,7 @@ type ControlPlaneService struct {
 // runtimeConfigAllowedFields is the set of JSON field names that can be patched.
 var runtimeConfigAllowedFields = map[string]bool{
 	"request_log_enabled":                      true,
+	"request_log_total_max_mb":                 true,
 	"reverse_proxy_log_detail_enabled":         true,
 	"reverse_proxy_log_req_headers_max_bytes":  true,
 	"reverse_proxy_log_req_body_max_bytes":     true,
@@ -153,7 +159,7 @@ func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*co
 	defer s.configMu.Unlock()
 
 	// 3. Deep-copy current config → apply patch.
-	newCfg := copyRuntimeConfig(s.RuntimeCfg.Load())
+	newCfg, _ := config.ApplyCompatibilityDefaults(copyRuntimeConfig(s.RuntimeCfg.Load()), s.EnvCfg)
 	if verr := parseRuntimeConfigPatch(patchJSON, newCfg); verr != nil {
 		return nil, verr
 	}
@@ -184,6 +190,9 @@ func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*co
 	// 6. Atomic swap.
 	s.RuntimeCfg.Store(newCfg)
 	s.configVersion = newVersion
+	if s.RequestLogRepo != nil {
+		s.RequestLogRepo.SetTotalMaxBytes(int64(newCfg.RequestLogTotalMaxMB) * 1024 * 1024)
+	}
 
 	return newCfg, nil
 }
@@ -200,6 +209,9 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")
+	}
+	if cfg.RequestLogTotalMaxMB <= 0 {
+		return invalidArg("request_log_total_max_mb: must be positive")
 	}
 	// Request log bytes fields must be non-negative.
 	if cfg.ReverseProxyLogReqHeadersMaxBytes < 0 {

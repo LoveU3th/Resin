@@ -1,5 +1,6 @@
 export type RuntimeConfig = {
   request_log_enabled: boolean;
+  request_log_total_max_mb: number;
   reverse_proxy_log_detail_enabled: boolean;
   reverse_proxy_log_req_headers_max_bytes: number;
   reverse_proxy_log_req_body_max_bytes: number;

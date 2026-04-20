@@ -15,12 +15,23 @@ import (
 )
 
 type patchHarness struct {
-	cp         *ControlPlaneService
-	engine     *state.StateEngine
-	runtimeCfg *atomic.Pointer[config.RuntimeConfig]
-	stateDir   string
-	cacheDir   string
-	closeDB    func()
+	cp             *ControlPlaneService
+	engine         *state.StateEngine
+	runtimeCfg     *atomic.Pointer[config.RuntimeConfig]
+	requestLogRepo *recordingRequestLogRepo
+	stateDir       string
+	cacheDir       string
+	closeDB        func()
+}
+
+type recordingRequestLogRepo struct {
+	lastTotalMaxBytes int64
+	callCount         int
+}
+
+func (r *recordingRequestLogRepo) SetTotalMaxBytes(totalMaxBytes int64) {
+	r.lastTotalMaxBytes = totalMaxBytes
+	r.callCount++
 }
 
 func newPatchHarness(t *testing.T) patchHarness {
@@ -37,16 +48,20 @@ func newPatchHarness(t *testing.T) patchHarness {
 
 	runtimeCfg := &atomic.Pointer[config.RuntimeConfig]{}
 	runtimeCfg.Store(config.NewDefaultRuntimeConfig())
+	requestLogRepo := &recordingRequestLogRepo{}
 
 	h := patchHarness{
 		cp: &ControlPlaneService{
-			Engine:     engine,
-			RuntimeCfg: runtimeCfg,
+			Engine:         engine,
+			RuntimeCfg:     runtimeCfg,
+			EnvCfg:         &config.EnvConfig{RequestLogDBMaxMB: 100, RequestLogDBRetainCount: 2},
+			RequestLogRepo: requestLogRepo,
 		},
-		engine:     engine,
-		runtimeCfg: runtimeCfg,
-		stateDir:   stateDir,
-		cacheDir:   cacheDir,
+		engine:         engine,
+		runtimeCfg:     runtimeCfg,
+		requestLogRepo: requestLogRepo,
+		stateDir:       stateDir,
+		cacheDir:       cacheDir,
 		closeDB: func() {
 			_ = closer.Close()
 		},
@@ -69,6 +84,7 @@ func TestPatchRuntimeConfig_HotUpdatePersistsAndSurvivesRestart(t *testing.T) {
 
 	patch := map[string]any{
 		"request_log_enabled":                     true,
+		"request_log_total_max_mb":                150,
 		"reverse_proxy_log_req_headers_max_bytes": 2048,
 		"p2c_latency_window":                      "7m",
 		"cache_flush_interval":                    "30s",
@@ -86,6 +102,15 @@ func TestPatchRuntimeConfig_HotUpdatePersistsAndSurvivesRestart(t *testing.T) {
 	if !updated.RequestLogEnabled {
 		t.Fatal("request_log_enabled should be true after patch")
 	}
+	if updated.RequestLogTotalMaxMB != 150 {
+		t.Fatalf("request_log_total_max_mb=%d, want 150", updated.RequestLogTotalMaxMB)
+	}
+	if h.requestLogRepo.callCount != 1 {
+		t.Fatalf("request log repo SetTotalMaxBytes callCount=%d, want 1", h.requestLogRepo.callCount)
+	}
+	if h.requestLogRepo.lastTotalMaxBytes != 150*1024*1024 {
+		t.Fatalf("request log repo total max bytes=%d, want %d", h.requestLogRepo.lastTotalMaxBytes, 150*1024*1024)
+	}
 	if updated.ReverseProxyLogReqHeadersMaxBytes != 2048 {
 		t.Fatalf("reverse_proxy_log_req_headers_max_bytes=%d, want 2048", updated.ReverseProxyLogReqHeadersMaxBytes)
 	}
@@ -98,6 +123,7 @@ func TestPatchRuntimeConfig_HotUpdatePersistsAndSurvivesRestart(t *testing.T) {
 
 	live := h.runtimeCfg.Load()
 	if !live.RequestLogEnabled ||
+		live.RequestLogTotalMaxMB != 150 ||
 		live.ReverseProxyLogReqHeadersMaxBytes != 2048 ||
 		time.Duration(live.P2CLatencyWindow) != 7*time.Minute ||
 		time.Duration(live.CacheFlushInterval) != 30*time.Second {
@@ -112,6 +138,7 @@ func TestPatchRuntimeConfig_HotUpdatePersistsAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("persisted version=%d, want 1", ver)
 	}
 	if !persisted.RequestLogEnabled ||
+		persisted.RequestLogTotalMaxMB != 150 ||
 		persisted.ReverseProxyLogReqHeadersMaxBytes != 2048 ||
 		time.Duration(persisted.P2CLatencyWindow) != 7*time.Minute ||
 		time.Duration(persisted.CacheFlushInterval) != 30*time.Second {
@@ -131,6 +158,7 @@ func TestPatchRuntimeConfig_HotUpdatePersistsAndSurvivesRestart(t *testing.T) {
 		t.Fatalf("GetSystemConfig (restart): %v", err)
 	}
 	if !afterRestart.RequestLogEnabled ||
+		afterRestart.RequestLogTotalMaxMB != 150 ||
 		afterRestart.ReverseProxyLogReqHeadersMaxBytes != 2048 ||
 		time.Duration(afterRestart.P2CLatencyWindow) != 7*time.Minute ||
 		time.Duration(afterRestart.CacheFlushInterval) != 30*time.Second {
@@ -249,6 +277,22 @@ func TestPatchRuntimeConfig_DoesNotMutateOldSliceSnapshot(t *testing.T) {
 	}
 	if reflect.DeepEqual(after.LatencyAuthorities, beforeAuthorities) {
 		t.Fatalf("new snapshot latency_authorities did not apply patch: %v", after.LatencyAuthorities)
+	}
+}
+
+func TestPatchRuntimeConfig_BackfillsMissingRequestLogTotalBeforeValidation(t *testing.T) {
+	h := newPatchHarness(t)
+
+	legacyCfg := config.NewDefaultRuntimeConfig()
+	legacyCfg.RequestLogTotalMaxMB = 0
+	h.runtimeCfg.Store(legacyCfg)
+
+	updated, err := h.cp.PatchRuntimeConfig([]byte(`{"cache_flush_interval":"30s"}`))
+	if err != nil {
+		t.Fatalf("PatchRuntimeConfig: %v", err)
+	}
+	if updated.RequestLogTotalMaxMB != 200 {
+		t.Fatalf("request_log_total_max_mb=%d, want 200", updated.RequestLogTotalMaxMB)
 	}
 }
 
