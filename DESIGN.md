@@ -2358,6 +2358,7 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 
 #### 请求日志设置
 * `RequestLogEnabled`: 是否开启请求日志记录。此开关实时生效。默认 True。
+* `RequestLogTotalMaxMB`: 请求日志总存储上限（单位 MB）。超限时会优先删除更旧的日志分片。默认 200。
 * `ReverseProxyLogDetailEnabled`: 是否记录反向代理的详细日志（请求/响应头与体）。默认 False。
 * `ReverseProxyLogReqHeadersMaxBytes`: 记录请求头的最大字节数。默认 4KB。
 * `ReverseProxyLogReqBodyMaxBytes`: 记录请求体的最大字节数。默认 1KB。
