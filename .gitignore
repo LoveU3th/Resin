@@ -8,3 +8,4 @@ start-instance.sh
 .claude/
 .omc/
 .local/
+.spec-workflow/*
