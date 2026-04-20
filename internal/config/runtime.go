@@ -7,6 +7,7 @@ import "time"
 type RuntimeConfig struct {
 	// Request log
 	RequestLogEnabled                  bool `json:"request_log_enabled"`
+	RequestLogTotalMaxMB               int  `json:"request_log_total_max_mb"`
 	ReverseProxyLogDetailEnabled       bool `json:"reverse_proxy_log_detail_enabled"`
 	ReverseProxyLogReqHeadersMaxBytes  int  `json:"reverse_proxy_log_req_headers_max_bytes"`
 	ReverseProxyLogReqBodyMaxBytes     int  `json:"reverse_proxy_log_req_body_max_bytes"`
@@ -37,6 +38,7 @@ type RuntimeConfig struct {
 func NewDefaultRuntimeConfig() *RuntimeConfig {
 	return &RuntimeConfig{
 		RequestLogEnabled:                  true,
+		RequestLogTotalMaxMB:               200,
 		ReverseProxyLogDetailEnabled:       false,
 		ReverseProxyLogReqHeadersMaxBytes:  4096,
 		ReverseProxyLogReqBodyMaxBytes:     1024,
@@ -57,4 +59,30 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		CacheFlushInterval:       Duration(5 * time.Minute),
 		CacheFlushDirtyThreshold: 1000,
 	}
+}
+
+// ApplyCompatibilityDefaults fills runtime config fields that may be missing in
+// configs persisted by older versions. It returns the updated config and
+// whether any field was backfilled.
+func ApplyCompatibilityDefaults(cfg *RuntimeConfig, envCfg *EnvConfig) (*RuntimeConfig, bool) {
+	if cfg == nil {
+		return NewDefaultRuntimeConfig(), true
+	}
+
+	out := *cfg
+	changed := false
+
+	if out.RequestLogTotalMaxMB <= 0 {
+		out.RequestLogTotalMaxMB = defaultRequestLogTotalMaxMB(envCfg)
+		changed = true
+	}
+
+	return &out, changed
+}
+
+func defaultRequestLogTotalMaxMB(envCfg *EnvConfig) int {
+	if envCfg != nil && envCfg.RequestLogDBMaxMB > 0 && envCfg.RequestLogDBRetainCount > 0 {
+		return envCfg.RequestLogDBMaxMB * envCfg.RequestLogDBRetainCount
+	}
+	return 200
 }
