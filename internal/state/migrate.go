@@ -19,11 +19,12 @@ const (
 	// Keep these version markers in sync with SQL files under migrations/state/.
 	// stateLegacyBaselineVersion must remain fixed to the highest migration
 	// version covered by compatibility detection for pre-migrate databases.
-	stateVersionBaseSchema              = 1
-	stateVersionAddEmptyAccountBehavior = 2
-	stateVersionAddFixedAccountHeader   = 3
-	stateVersionNormalizeMissAction     = 4
-	stateLegacyBaselineVersion          = stateVersionAddFixedAccountHeader
+	stateVersionBaseSchema               = 1
+	stateVersionAddEmptyAccountBehavior  = 2
+	stateVersionAddFixedAccountHeader    = 3
+	stateVersionNormalizeMissAction      = 4
+	stateVersionAddIncrementalAliveNodes = 5
+	stateLegacyBaselineVersion           = stateVersionAddFixedAccountHeader
 )
 
 //go:embed migrations/state/*.sql migrations/cache/*.sql
@@ -104,8 +105,14 @@ func prepareLegacyStateBaseline(db *sql.DB, driver migratedb.Driver) error {
 	if err != nil {
 		return err
 	}
+	hasIncrementalAliveNodes, err := hasTableColumn(db, "subscriptions", "incremental_alive_nodes")
+	if err != nil {
+		return err
+	}
 
 	switch {
+	case hasEmptyBehavior && hasFixedHeader && hasIncrementalAliveNodes:
+		return setMigrationVersion(driver, stateVersionAddIncrementalAliveNodes)
 	case hasEmptyBehavior && hasFixedHeader:
 		return setMigrationVersion(driver, stateLegacyBaselineVersion)
 	case hasEmptyBehavior && !hasFixedHeader:

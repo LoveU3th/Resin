@@ -386,17 +386,18 @@ func bootstrapTopology(
 	if err != nil {
 		return fmt.Errorf("load subscriptions: %w", err)
 	}
-	for _, ms := range dbSubs {
-		sub := subscription.NewSubscription(ms.ID, ms.Name, ms.URL, ms.Enabled, ms.Ephemeral)
-		sub.SetFetchConfig(ms.URL, ms.UpdateIntervalNs)
-		sub.SetSourceType(ms.SourceType)
-		sub.SetContent(ms.Content)
-		sub.SetEphemeralNodeEvictDelayNs(ms.EphemeralNodeEvictDelayNs)
-		sub.CreatedAtNs = ms.CreatedAtNs
-		sub.UpdatedAtNs = ms.UpdatedAtNs
-		subManager.Register(sub)
-	}
-	log.Printf("Loaded %d subscriptions from state.db", len(dbSubs))
+		for _, ms := range dbSubs {
+			sub := subscription.NewSubscription(ms.ID, ms.Name, ms.URL, ms.Enabled, ms.Ephemeral)
+			sub.SetFetchConfig(ms.URL, ms.UpdateIntervalNs)
+			sub.SetSourceType(ms.SourceType)
+			sub.SetContent(ms.Content)
+			sub.SetIncrementalAliveNodes(ms.IncrementalAliveNodes)
+			sub.SetEphemeralNodeEvictDelayNs(ms.EphemeralNodeEvictDelayNs)
+			sub.CreatedAtNs = ms.CreatedAtNs
+			sub.UpdatedAtNs = ms.UpdatedAtNs
+			subManager.Register(sub)
+		}
+		log.Printf("Loaded %d subscriptions from state.db", len(dbSubs))
 
 	dbPlats, err := engine.ListPlatforms()
 	if err != nil {
