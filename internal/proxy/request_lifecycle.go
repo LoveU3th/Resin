@@ -144,6 +144,12 @@ func (l *requestLifecycle) setAccount(account string) {
 	l.log.Account = account
 }
 
+func (l *requestLifecycle) setPlatform(platformID, platformName string) {
+	l.finished.PlatformID = platformID
+	l.log.PlatformID = platformID
+	l.log.PlatformName = platformName
+}
+
 func (l *requestLifecycle) setTarget(host, rawURL string) {
 	l.log.TargetHost = host
 	l.log.TargetURL = rawURL
@@ -170,9 +176,7 @@ func (l *requestLifecycle) setRespBodyCapture(c *payloadCaptureReadCloser) {
 }
 
 func (l *requestLifecycle) setRouteResult(result routing.RouteResult) {
-	l.finished.PlatformID = result.PlatformID
-	l.log.PlatformID = result.PlatformID
-	l.log.PlatformName = result.PlatformName
+	l.setPlatform(result.PlatformID, result.PlatformName)
 	l.log.NodeHash = result.NodeHash.Hex()
 	l.log.NodeTag = result.NodeTag
 	l.log.EgressIP = result.EgressIP.String()
