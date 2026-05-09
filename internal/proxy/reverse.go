@@ -373,6 +373,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 2) If extraction fails, apply miss-action (REJECT or treat-as-empty).
 	// 3) Continue routing with the resulting account (possibly empty).
 	behaviorPlatform := p.resolvePlatformForAccountBehavior(parsed.PlatformName)
+	if behaviorPlatform != nil {
+		lifecycle.setPlatform(behaviorPlatform.ID, behaviorPlatform.Name)
+	} else {
+		lifecycle.setPlatform("", parsed.PlatformName)
+	}
 	account, _, extractionFailed := p.resolveReverseProxyAccount(parsed, r, behaviorPlatform)
 	lifecycle.setAccount(account)
 
