@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,7 +24,9 @@ import (
 // --- Mock infrastructure ---
 
 type mockPool struct {
-	entry *node.NodeEntry
+	entry         *node.NodeEntry
+	platforms     map[string]*platform.Platform
+	platformNames map[string]*platform.Platform
 }
 
 func (m *mockPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
@@ -36,11 +39,27 @@ func (m *mockPool) GetEntry(hash node.Hash) (*node.NodeEntry, bool) {
 func (m *mockPool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {}
 
 func (m *mockPool) GetPlatform(id string) (*platform.Platform, bool) {
-	return nil, false
+	if m.platforms == nil {
+		return nil, false
+	}
+	p, ok := m.platforms[id]
+	return p, ok
 }
 
 func (m *mockPool) GetPlatformByName(name string) (*platform.Platform, bool) {
-	return nil, false
+	if m.platformNames == nil {
+		return nil, false
+	}
+	p, ok := m.platformNames[name]
+	return p, ok
+}
+
+func (m *mockPool) RangePlatforms(fn func(*platform.Platform) bool) {
+	for _, p := range m.platforms {
+		if !fn(p) {
+			return
+		}
+	}
 }
 
 type mockHealthRecorder struct {
@@ -1102,6 +1121,75 @@ func TestReverseProxy_AccountRejection_EmptyPlatform(t *testing.T) {
 	}
 	if w.Header().Get("X-Resin-Error") != "ACCOUNT_REJECTED" {
 		t.Fatalf("expected ACCOUNT_REJECTED, got %q", w.Header().Get("X-Resin-Error"))
+	}
+}
+
+func TestReverseProxy_RouteFailureLogsParsedPlatform(t *testing.T) {
+	plat := platform.NewPlatform("p-load-balance", "负载均衡", nil, nil)
+	plat.ReverseProxyMissAction = string(platform.ReverseProxyMissActionTreatAsEmpty)
+	plat.ReverseProxyEmptyAccountBehavior = string(platform.ReverseProxyEmptyAccountBehaviorRandom)
+
+	pool := &mockPool{
+		platforms: map[string]*platform.Platform{
+			plat.ID: plat,
+		},
+		platformNames: map[string]*platform.Platform{
+			plat.Name: plat,
+		},
+	}
+	emitter := newMockEventEmitter()
+	rp := &ReverseProxy{
+		token:       "tok",
+		authVersion: "V1",
+		router: routing.NewRouter(routing.RouterConfig{
+			Pool:        pool,
+			Authorities: func() []string { return nil },
+			P2CWindow:   func() time.Duration { return time.Minute },
+		}),
+		pool:     pool,
+		platLook: pool,
+		events:   emitter,
+	}
+
+	req := httptest.NewRequest("GET", "/tok/"+url.PathEscape(plat.Name)+"/https/example.com/path", nil)
+	w := httptest.NewRecorder()
+	rp.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", w.Code)
+	}
+	if w.Header().Get("X-Resin-Error") != "NO_AVAILABLE_NODES" {
+		t.Fatalf("expected NO_AVAILABLE_NODES, got %q", w.Header().Get("X-Resin-Error"))
+	}
+
+	select {
+	case logEv := <-emitter.logCh:
+		if logEv.PlatformID != plat.ID {
+			t.Fatalf("PlatformID: got %q, want %q", logEv.PlatformID, plat.ID)
+		}
+		if logEv.PlatformName != plat.Name {
+			t.Fatalf("PlatformName: got %q, want %q", logEv.PlatformName, plat.Name)
+		}
+		if logEv.Account != "" {
+			t.Fatalf("Account: got %q, want empty", logEv.Account)
+		}
+		if logEv.HTTPStatus != http.StatusServiceUnavailable {
+			t.Fatalf("HTTPStatus: got %d, want %d", logEv.HTTPStatus, http.StatusServiceUnavailable)
+		}
+		if logEv.ResinError != "NO_AVAILABLE_NODES" {
+			t.Fatalf("ResinError: got %q, want NO_AVAILABLE_NODES", logEv.ResinError)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected request log event")
+	}
+
+	select {
+	case finished := <-emitter.finishedCh:
+		if finished.PlatformID != plat.ID {
+			t.Fatalf("finished PlatformID: got %q, want %q", finished.PlatformID, plat.ID)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected finished event")
 	}
 }
 
