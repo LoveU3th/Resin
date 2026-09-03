@@ -16,8 +16,9 @@ const (
 	// ForwardStickyAccountHost sticks on the exact target host
 	// (port stripped, lowercased).
 	ForwardStickyAccountHost ForwardStickyAccount = "HOST"
-	// ForwardStickyAccountDomain sticks on the target eTLD+1, so all
-	// subdomains of one site share the same egress IP.
+	// ForwardStickyAccountDomain sticks on the target registrable domain,
+	// computed with ICANN rules only (the Public Suffix List private section
+	// is ignored), so all subdomains of one site share the same egress IP.
 	ForwardStickyAccountDomain ForwardStickyAccount = "DOMAIN"
 )
 

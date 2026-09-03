@@ -10,7 +10,8 @@ import (
 //
 //   - OFF (default): keep stock behavior — an empty account routes randomly.
 //   - HOST: account = target host (port stripped, lowercased).
-//   - DOMAIN: account = target eTLD+1, so subdomains of one site stay together.
+//   - DOMAIN: account = target registrable domain (ICANN rules only), so
+//     subdomains of one site stay together.
 //
 // An account explicitly carried by the credentials always wins, so per-client
 // identity keeps working when configured.
@@ -28,7 +29,7 @@ func resolveForwardStickyAccount(
 			return host
 		}
 	case platform.ForwardStickyAccountDomain:
-		if domain := netutil.ExtractDomain(target); domain != "" {
+		if domain := netutil.ExtractICANNDomain(target); domain != "" {
 			return domain
 		}
 	}

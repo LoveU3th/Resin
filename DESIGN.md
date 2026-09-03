@@ -2305,7 +2305,9 @@ GeoIP 与订阅的下载都有错误重试的需求。
 * `RESIN_FORWARD_STICKY_ACCOUNT`：正向代理（HTTP 与 SOCKS5）在客户端未提供 Account 时，粘性 Account 的来源。枚举：`OFF|HOST|DOMAIN`（大小写不敏感，允许 `$` 前缀，非法值拒绝启动）。默认 `OFF`。仅作用于正向代理，不影响反向代理的 Account 提取。
   * `OFF`：维持默认行为——空 Account 表示每请求随机选节点，不粘。
   * `HOST`：Account 取目标主机（剥离端口、转小写、IPv6 规范化），同一主机共用同一出口 IP。
-  * `DOMAIN`：Account 取目标 eTLD+1（基于 Public Suffix List，IP / 无点号主机名回退为原主机），同一站点的所有子域共用同一出口 IP。
+  * `DOMAIN`：Account 取目标注册域（只用 Public Suffix List 的 ICANN 段，忽略私有段；IP / 无点号主机名回退为原主机），同一站点的所有子域共用同一出口 IP。
+    * 私有段收录的是 CDN / 托管平台（如 `githubusercontent.com`、`cloudfront.net`、`netlify.app`）。若按私有段切分，`raw.`/`camo.`/`avatars.githubusercontent.com` 会被算成三个站点；忽略私有段后它们统一归到 `githubusercontent.com`。代价是聚合更粗，例如 `bucket.s3.amazonaws.com` 归到 `amazonaws.com`。
+    * 注意粘性取值与选路/延迟统计用的 `netutil.ExtractDomain`（完整 PSL，含私有段）不同，后者语义不变。
   * 客户端凭证中显式携带的 Account 优先级最高，因此配置后每个客户端的身份仍然可用。
 
 日志相关配置：
