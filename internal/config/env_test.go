@@ -72,7 +72,12 @@ func TestLoadEnvConfig_Defaults(t *testing.T) {
 	assertEqual(t, "NodeDNSUpstreams[3]", cfg.NodeDNSUpstreams[3], "local")
 	assertEqual(t, "ProxyTransportMaxIdleConns", cfg.ProxyTransportMaxIdleConns, 1024)
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 64)
-	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 90*time.Second)
+	// 45s stays below the ~60s idle cutoff most upstreams apply.
+	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 45*time.Second)
+	assertEqual(t, "ProxyTransportDialTimeout", cfg.ProxyTransportDialTimeout, 10*time.Second)
+	assertEqual(t, "ProxyTransportTLSHandshakeTimeout", cfg.ProxyTransportTLSHandshakeTimeout, 10*time.Second)
+	assertEqual(t, "ProxyTransportResponseHeaderTimeout", cfg.ProxyTransportResponseHeaderTimeout, 60*time.Second)
+	assertEqual(t, "ProxyTransportKeepAlivePeriod", cfg.ProxyTransportKeepAlivePeriod, 30*time.Second)
 	assertEqual(t, "ProxyBypassRulesLength", len(cfg.ProxyBypassRules), 0)
 
 	// Request log
@@ -590,6 +595,81 @@ func TestLoadEnvConfig_InvalidProxyTransportSettings(t *testing.T) {
 	}
 	assertContains(t, err.Error(), "RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT")
 	assertContains(t, err.Error(), "RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST")
+}
+
+// The four dial/response timeouts were added without any validation coverage,
+// so a malformed value would silently fall back to the default.
+func TestLoadEnvConfig_InvalidProxyTransportTimeouts(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		wantErr string
+	}{
+		{"dial timeout", "RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT", "RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT"},
+		{"tls handshake timeout", "RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT", "RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT"},
+		{"keep alive period", "RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD", "RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envs := requiredEnvs()
+			envs[tc.env] = "abc"
+			setEnvs(t, envs)
+
+			if _, err := LoadEnvConfig(); err == nil {
+				t.Fatalf("expected error for %s=abc", tc.env)
+			} else {
+				assertContains(t, err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+// These three reject 0; ResponseHeaderTimeout instead treats 0 as "disabled"
+// and rejects only negative values.
+func TestLoadEnvConfig_ZeroProxyTransportTimeouts(t *testing.T) {
+	rejectsZero := []string{
+		"RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT",
+		"RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT",
+		"RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT",
+		"RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD",
+	}
+	for _, env := range rejectsZero {
+		t.Run(env, func(t *testing.T) {
+			envs := requiredEnvs()
+			envs[env] = "0s"
+			setEnvs(t, envs)
+
+			_, err := LoadEnvConfig()
+			if err == nil {
+				t.Fatalf("expected error for %s=0s", env)
+			}
+			assertContains(t, err.Error(), "must be positive")
+		})
+	}
+
+	t.Run("response header timeout zero disables it", func(t *testing.T) {
+		envs := requiredEnvs()
+		envs["RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT"] = "0s"
+		setEnvs(t, envs)
+
+		cfg, err := LoadEnvConfig()
+		if err != nil {
+			t.Fatalf("0s must disable the timeout, not be rejected: %v", err)
+		}
+		assertEqual(t, "ResponseHeaderTimeout", cfg.ProxyTransportResponseHeaderTimeout, time.Duration(0))
+	})
+
+	t.Run("response header timeout rejects negative", func(t *testing.T) {
+		envs := requiredEnvs()
+		envs["RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT"] = "-1s"
+		setEnvs(t, envs)
+
+		_, err := LoadEnvConfig()
+		if err == nil {
+			t.Fatal("expected error for negative response header timeout")
+		}
+		assertContains(t, err.Error(), "must not be negative")
+	})
 }
 
 // --- test helpers ---

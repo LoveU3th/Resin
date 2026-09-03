@@ -84,7 +84,7 @@ func prepareConnectTunnel(
 	domain := netutil.ExtractDomain(target)
 	nodeHashRaw := routed.Route.NodeHash
 	if deps.health != nil {
-		go deps.health.RecordLatency(nodeHashRaw, domain, nil)
+		go deps.health.RecordPassiveLatency(nodeHashRaw, domain, nil)
 	}
 
 	rawConn, err := routed.Outbound.DialContext(ctx, "tcp", M.ParseSocksaddr(target))
@@ -121,7 +121,7 @@ func prepareConnectTunnel(
 
 	upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 		if deps.health != nil {
-			deps.health.RecordLatency(nodeHashRaw, domain, &latency)
+			deps.health.RecordPassiveLatency(nodeHashRaw, domain, &latency)
 		}
 	})
 

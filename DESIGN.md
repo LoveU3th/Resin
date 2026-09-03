@@ -379,7 +379,8 @@ Platform 过滤时，通过 `NodeEntry.MatchRegexs` 方法，反向查询 Refere
 	* `success=true`：重置连续失败计数 (`FailureCount = 0`)。若节点当前处于熔断状态，立即恢复（`清空 CircuitOpenSince`）。
 	* `success=false`：原子递增连续失败计数。若计数达到配置的阈值 (`MaxConsecutiveFailures`)，触发熔断（`CircuitOpenSince = 当前时间`）。
 * `RecordPassiveResult(platformID string, id NodeHash, success bool)`：提交来自用户代理流量的被动网络结果。若对应 Platform 开启 `passive_circuit_breaker_disabled`，则忽略失败结果，不增加连续失败计数；成功结果仍作为正向健康反馈处理。
-* `RecordLatency(id NodeHash, domain string, latency *Duration)`：提交节点对特定域名的延迟探测尝试。`latency=nil` 表示“仅记录本次探测尝试，不写延迟样本”；`latency!=nil` 时按 TD-EWMA 更新延迟统计。无论 `latency` 是否为空，都会更新 `LastLatencyProbeAttempt`，若域名属于 `LatencyAuthorities` 还会更新 `LastAuthorityLatencyProbeAttempt`。如果调用本次 `RecordLatency` 之前，节点的 `LatencyTable` 为空，需要通知各 Platform 重新过滤这个节点。
+* `RecordLatency(id NodeHash, domain string, latency *Duration)`：提交节点对特定域名的**主动探测**尝试。`latency=nil` 表示“仅记录本次探测尝试，不写延迟样本”；`latency!=nil` 时按 TD-EWMA 更新延迟统计。无论 `latency` 是否为空，都会更新 `LastLatencyProbeAttempt`，若域名属于 `LatencyAuthorities` 还会更新 `LastAuthorityLatencyProbeAttempt`。如果调用本次 `RecordLatency` 之前，节点的 `LatencyTable` 为空，需要通知各 Platform 重新过滤这个节点。
+* `RecordPassiveLatency(id NodeHash, domain string, latency *Duration)`：提交来自用户真实流量的被动延迟样本。语义与 `RecordLatency` 一致（含 `latency=nil` 与 TD-EWMA 更新），**但不更新任何探测尝试时间戳**，因此不会影响主动探测的调度。数据面（正向代理、反向代理、CONNECT/SOCKS5 隧道）必须使用此接口。
 * `UpdateNodeEgressIP(id NodeHash, ip *netip.Addr)`：记录一次出口 IP 探测尝试并可选更新出口 IP。`ip=nil` 表示“仅记录尝试”；`ip!=nil` 时更新出口 IP（若变更则触发 Platform 脏更新）。无论 `ip` 是否为空，都会更新 `LastEgressUpdateAttempt`。
 
 ### 熔断与恢复机制
@@ -417,7 +418,8 @@ Resin 使用计数器熔断机制保护系统稳定性。
 	* `LastLatencyProbeAttempt` 已超过 `MaxLatencyTestInterval`
 	* `LastAuthorityLatencyProbeAttempt` 已超过 `MaxAuthorityLatencyTestInterval`
 * 调度策略：每隔 13～17 秒全局扫描一次，对未来 15 秒内将会或者已经满足探测时机的节点进行探测。
-* 探测动作：对全局配置的延迟探测站点发起 HTTP GET 请求，优先测量 **TLS Handshake** 耗时；若未产生 TLS 握手事件（如连接复用或明文 HTTP），回退为请求级 RTT（请求发起到首字节/请求完成）。
+* 探测动作：对全局配置的延迟探测站点发起 HTTP GET 请求，测量 **TTFB**（请求发起到收到首字节）。TTFB 覆盖拨号与 TLS 握手，因此能反映「握手很快、随后卡住或断连」的节点，而单纯测量握手耗时无法发现这类问题。
+* 成功判定：响应状态码必须属于 2xx。默认探测站点返回 204，故校验接受全部 2xx 而非仅 200；返回 502/503/407 一律记为探测失败。
 * 结果处理：
     * 成功：先调用 `RecordResult(true)`；调用 `RecordLatency(..., &latency)`（`latency<=0` 时仅记录尝试，不写样本）。
     * 失败：调用 `RecordResult(false)` 与 `RecordLatency(..., nil)`。连续失败将导致节点熔断。
@@ -448,13 +450,14 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
 为避免阻塞数据链路，所有被动探测数据的记录均为**异步**执行。
 * **采样率**：100%。由于被动反馈极其廉价（仅为内存计数与原子操作），系统对所有业务流量进行采样。
 * **尝试时间戳更新规则**：
-    * 普通站点访问：更新 `LastLatencyProbeAttempt`。
-    * 权威站点访问：更新 `LastLatencyProbeAttempt` 与 `LastAuthorityLatencyProbeAttempt`。
-    * 访问失败时仍会记录尝试（`RecordLatency(..., nil)`）。
+    * 被动流量**不更新**探测尝试时间戳（`LastLatencyProbeAttempt` / `LastAuthorityLatencyProbeAttempt`），走独立的 `RecordPassiveLatency` 通道。
+    * 原因：`ProbeManager` 依据这两个时间戳判断节点是否到期需主动探测。若每个请求都刷新它们（历史行为），持续有流量的节点将永远「未到期」，主动探测被饿死，UI 上的延迟逐渐变为陈旧值，节点劣化也无法被主动发现。
+    * 仅有主动探测通过 `RecordLatency` 更新这两个时间戳；主动探测失败时同样更新（`RecordLatency(..., nil)`），以免失败节点被反复重试。
+    * 被动延迟样本仍然写入 `LatencyTable`，只是不影响探测调度。
 * **反馈回路**：
     1. 流量经过代理。
     2. 代理捕获连接状态与握手耗时。
-    3. 异步调用 `RecordResult` 与 `RecordLatency`。
+    3. 异步调用 `RecordResult` 与 `RecordPassiveLatency`。
     4. 全局节点池更新节点的 `FailureCount`、`CircuitOpenSince` 状态及 `LatencyTable`。
 
 另外，如果节点的 Outbound 为空，跳过对其的探测，而不是记做失败。不能因为 Outbound 为空而把一个节点熔断。
@@ -2623,22 +2626,16 @@ func (c *tlsLatencyConn) Read(b []byte) (int, error) {
 
 ## httptrace Latency Probe 实现 (反向代理)
 ```go
-// ReverseProxy 中使用 httptrace 测量 TLS 握手延迟
+// ReverseProxy 中使用 httptrace 测量 TTFB（time to first byte）
 // 这种方式利用 Go 标准库钩子，无需劫持底层连接
 func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     // ...
-    var tlsStart time.Time
     if protocol == "https" {
         trace := &httptrace.ClientTrace{
-            TLSHandshakeStart: func() {
-                tlsStart = time.Now()
-            },
-            TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
-                if err == nil && !tlsStart.IsZero() {
-                    latency := time.Since(tlsStart)
-                    // 异步记录延迟（latency=nil 时仅记录尝试）
-                    go p.health.RecordLatency(result.NodeID, domain, &latency)
-                }
+            GotFirstResponseByte: func() {
+                latency := time.Since(requestStart)
+                // 数据面采样：走 RecordPassiveLatency，不更新探测尝试时间戳
+                go p.health.RecordPassiveLatency(result.NodeID, domain, &latency)
             },
         }
         requestCtx = httptrace.WithClientTrace(requestCtx, trace)
@@ -2646,6 +2643,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     // ...
 }
 ```
+
+> 说明：此处测量的是 TTFB（请求发起到收到首字节）而非 TLS 握手耗时。握手耗时的旧实现无法反映「握手很快、随后卡住或断连」的节点。
+> 数据面一律调用 `RecordPassiveLatency`；只有主动探测调用 `RecordLatency`。理由见「尝试时间戳更新规则」。
+
+实际实现见 `internal/proxy/reverse_latency.go` 的 `reverseLatencyReporter`。
 
 ## GeoIP 查询参考
 

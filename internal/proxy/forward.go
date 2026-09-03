@@ -351,7 +351,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		hasRoute = true
 		lifecycle.setRouteResult(route)
 		if p.health != nil {
-			go p.health.RecordLatency(route.NodeHash, netutil.ExtractDomain(r.Host), nil)
+			go p.health.RecordPassiveLatency(route.NodeHash, netutil.ExtractDomain(r.Host), nil)
 		}
 		transport = p.outboundHTTPTransport(routed)
 	}

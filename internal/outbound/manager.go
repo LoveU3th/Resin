@@ -143,7 +143,7 @@ func (m *OutboundManager) FetchWithUserAgent(
 		return nil, 0, ErrOutboundNotReady
 	}
 	return netutil.HTTPGetViaOutbound(ctx, *outboundPtr, url, netutil.OutboundHTTPOptions{
-		RequireStatusOK: true,
-		UserAgent:       userAgent,
+		RequireStatus2xx: true,
+		UserAgent:        userAgent,
 	})
 }

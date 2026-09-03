@@ -60,5 +60,5 @@ func (r *reverseLatencyReporter) reportSince(start time.Time) {
 	if latency <= 0 {
 		latency = time.Nanosecond
 	}
-	go r.health.RecordLatency(r.hash, r.domain, &latency)
+	go r.health.RecordPassiveLatency(r.hash, r.domain, &latency)
 }

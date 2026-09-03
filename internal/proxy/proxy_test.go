@@ -65,7 +65,10 @@ func (m *mockPool) RangePlatforms(fn func(*platform.Platform) bool) {
 type mockHealthRecorder struct {
 	resultCalls  atomic.Int32
 	latencyCalls atomic.Int32
-	lastSuccess  atomic.Int32 // 1=true, 0=false
+	// passiveLatencyCalls counts traffic-path samples, which must never
+	// advance the node's proactive probe-attempt timestamps.
+	passiveLatencyCalls atomic.Int32
+	lastSuccess         atomic.Int32 // 1=true, 0=false
 }
 
 func (m *mockHealthRecorder) RecordResult(hash node.Hash, success bool) {
@@ -79,6 +82,10 @@ func (m *mockHealthRecorder) RecordResult(hash node.Hash, success bool) {
 
 func (m *mockHealthRecorder) RecordLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
 	m.latencyCalls.Add(1)
+}
+
+func (m *mockHealthRecorder) RecordPassiveLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
+	m.passiveLatencyCalls.Add(1)
 }
 
 type mockPassiveHealthRecorder struct {

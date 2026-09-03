@@ -300,7 +300,9 @@ func newTopologyRuntime(
 				return nil, 0, outbound.ErrOutboundNotReady
 			}
 			return netutil.HTTPGetViaOutbound(ctx, *outboundPtr, url, netutil.OutboundHTTPOptions{
-				RequireStatusOK: false,
+				// Accept any 2xx: the latency probe target returns 204, and a
+				// node answering 502/503 must not count as healthy.
+				RequireStatus2xx: true,
 				OnConnLifecycle: func(op netutil.ConnLifecycleOp) {
 					if onProbeConnLifecycle != nil {
 						onProbeConnLifecycle(op)

@@ -429,7 +429,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		nodeHashRaw = route.NodeHash
 		lifecycle.setRouteResult(route)
 		if p.health != nil {
-			go p.health.RecordLatency(nodeHashRaw, domain, nil)
+			go p.health.RecordPassiveLatency(nodeHashRaw, domain, nil)
 		}
 		transport = p.outboundHTTPTransport(routed)
 	}

@@ -319,12 +319,13 @@ func TestReverseProxy_E2ESuccess(t *testing.T) {
 	host := strings.TrimPrefix(upstream.URL, "http://")
 	path := fmt.Sprintf("/tok/plat:acct/http/%s/api/v1/items?k=v", host)
 
+	health := &mockHealthRecorder{}
 	rp := NewReverseProxy(ReverseProxyConfig{
 		ProxyToken:     "tok",
 		Router:         env.router,
 		Pool:           env.pool,
 		PlatformLookup: env.pool,
-		Health:         &mockHealthRecorder{},
+		Health:         health,
 		Events:         NoOpEventEmitter{},
 	})
 
@@ -341,6 +342,21 @@ func TestReverseProxy_E2ESuccess(t *testing.T) {
 	}
 	if got := w.Body.String(); got != "reverse-e2e" {
 		t.Fatalf("body: got %q, want %q", got, "reverse-e2e")
+	}
+
+	// Traffic-path latency samples are recorded asynchronously.
+	deadline := time.Now().Add(2 * time.Second)
+	for health.passiveLatencyCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := health.passiveLatencyCalls.Load(); got == 0 {
+		t.Fatal("expected the data path to record a passive latency sample")
+	}
+	// Traffic must never touch the proactive probe channel: that channel also
+	// advances the probe-due timestamps, and refreshing them per request is
+	// what starved proactive probing for busy nodes.
+	if got := health.latencyCalls.Load(); got != 0 {
+		t.Fatalf("data path used RecordLatency %d time(s), want 0", got)
 	}
 }
 

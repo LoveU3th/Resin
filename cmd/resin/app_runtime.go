@@ -415,9 +415,13 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 
 	proxyEvents := a.buildProxyEvents()
 	outboundTransportCfg := proxy.OutboundTransportConfig{
-		MaxIdleConns:        a.envCfg.ProxyTransportMaxIdleConns,
-		MaxIdleConnsPerHost: a.envCfg.ProxyTransportMaxIdleConnsPerHost,
-		IdleConnTimeout:     a.envCfg.ProxyTransportIdleConnTimeout,
+		MaxIdleConns:          a.envCfg.ProxyTransportMaxIdleConns,
+		MaxIdleConnsPerHost:   a.envCfg.ProxyTransportMaxIdleConnsPerHost,
+		IdleConnTimeout:       a.envCfg.ProxyTransportIdleConnTimeout,
+		DialTimeout:           a.envCfg.ProxyTransportDialTimeout,
+		TLSHandshakeTimeout:   a.envCfg.ProxyTransportTLSHandshakeTimeout,
+		ResponseHeaderTimeout: a.envCfg.ProxyTransportResponseHeaderTimeout,
+		KeepAlivePeriod:       a.envCfg.ProxyTransportKeepAlivePeriod,
 	}
 	if a.transportPool == nil {
 		a.transportPool = proxy.NewOutboundTransportPool(outboundTransportCfg)

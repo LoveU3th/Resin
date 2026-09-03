@@ -391,6 +391,56 @@ func TestRecordLatency_AttemptOnly_UpdatesAttemptTimestamps(t *testing.T) {
 	}
 }
 
+// Traffic-path samples must not advance the probe-attempt timestamps.
+// ProbeManager decides whether a node is due for a proactive probe from those
+// timestamps, so letting user traffic refresh them meant a busy node was never
+// due again: the latency shown in the UI went stale and a degrading node kept
+// looking healthy.
+func TestRecordPassiveLatency_DoesNotUpdateAttemptTimestamps(t *testing.T) {
+	var dynamicCBCount atomic.Int32
+	pool := NewGlobalNodePool(PoolConfig{
+		SubLookup:              NewSubscriptionManager().Lookup,
+		GeoLookup:              func(netip.Addr) string { return "" },
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		LatencyAuthorities:     func() []string { return []string{"example.com"} },
+		OnNodeDynamicChanged:   func(hash node.Hash) { dynamicCBCount.Add(1) },
+	})
+
+	raw := `{"type":"ss","n":"passive-latency"}`
+	h := node.HashFromRawOptions([]byte(raw))
+	pool.AddNodeFromSub(h, []byte(raw), "s1")
+
+	entry, _ := pool.GetEntry(h)
+
+	// Nil sample: the common data-path call.
+	pool.RecordPassiveLatency(h, "www.example.com:443", nil)
+
+	if entry.LastLatencyProbeAttempt.Load() != 0 {
+		t.Fatal("passive sample must not advance LastLatencyProbeAttempt")
+	}
+	if entry.LastAuthorityLatencyProbeAttempt.Load() != 0 {
+		t.Fatal("passive sample must not advance LastAuthorityLatencyProbeAttempt")
+	}
+	if entry.HasLatency() {
+		t.Fatal("nil passive sample must not write a latency sample")
+	}
+	if dynamicCBCount.Load() != 1 {
+		t.Fatalf("expected 1 dynamic callback, got %d", dynamicCBCount.Load())
+	}
+
+	// A real sample must still land in the latency table.
+	latency := 25 * time.Millisecond
+	pool.RecordPassiveLatency(h, "www.example.com:443", &latency)
+
+	if !entry.HasLatency() {
+		t.Fatal("passive sample with latency must write a latency sample")
+	}
+	if entry.LastLatencyProbeAttempt.Load() != 0 {
+		t.Fatal("passive sample with latency must not advance LastLatencyProbeAttempt")
+	}
+}
+
 // --- UpdateNodeEgressIP tests ---
 
 func TestUpdateNodeEgressIP_Change(t *testing.T) {

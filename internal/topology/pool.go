@@ -587,10 +587,32 @@ func (p *GlobalNodePool) currentMaxConsecutiveFailures() int {
 	return p.maxConsecutiveFailures()
 }
 
-// RecordLatency records a latency probe attempt for the given node and raw target.
+// RecordLatency records a proactive latency probe attempt for the given node and raw target.
 // rawTarget is normalized through ExtractDomain (eTLD+1). latency may be nil,
 // which means "attempt only" without latency sample writeback.
+//
+// This refreshes the probe-attempt timestamps that ProbeManager uses to decide
+// whether a node is due for a proactive probe. Callers sampling latency from
+// user traffic MUST use RecordPassiveLatency instead, otherwise busy nodes
+// never appear due and proactive probing is starved entirely.
 func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
+	p.recordLatency(hash, rawTarget, latency, true)
+}
+
+// RecordPassiveLatency records a latency sample observed from user traffic.
+// Identical to RecordLatency except that it leaves the probe-attempt
+// timestamps untouched, so proactive probing keeps running on its normal
+// schedule even for nodes serving continuous traffic.
+func (p *GlobalNodePool) RecordPassiveLatency(hash node.Hash, rawTarget string, latency *time.Duration) {
+	p.recordLatency(hash, rawTarget, latency, false)
+}
+
+func (p *GlobalNodePool) recordLatency(
+	hash node.Hash,
+	rawTarget string,
+	latency *time.Duration,
+	proactive bool,
+) {
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
 		return
@@ -598,10 +620,12 @@ func (p *GlobalNodePool) RecordLatency(hash node.Hash, rawTarget string, latency
 
 	domain := netutil.ExtractDomain(rawTarget)
 	isAuthority := p.isAuthorityDomain(domain)
-	nowNs := time.Now().UnixNano()
-	entry.LastLatencyProbeAttempt.Store(nowNs)
-	if isAuthority {
-		entry.LastAuthorityLatencyProbeAttempt.Store(nowNs)
+	if proactive {
+		nowNs := time.Now().UnixNano()
+		entry.LastLatencyProbeAttempt.Store(nowNs)
+		if isAuthority {
+			entry.LastAuthorityLatencyProbeAttempt.Store(nowNs)
+		}
 	}
 	if p.onNodeDynamicChanged != nil {
 		p.onNodeDynamicChanged(hash)

@@ -42,10 +42,21 @@ type EnvConfig struct {
 	ProbeTimeout                                    time.Duration
 	ResourceFetchTimeout                            time.Duration
 	NodeDNSUpstreams                                []string
-	ProxyTransportMaxIdleConns                      int
-	ProxyTransportMaxIdleConnsPerHost               int
-	ProxyTransportIdleConnTimeout                   time.Duration
-	ProxyBypassRules                                []string
+	ProxyTransportMaxIdleConns        int
+	ProxyTransportMaxIdleConnsPerHost int
+	ProxyTransportIdleConnTimeout     time.Duration
+	// ProxyTransportDialTimeout bounds one outbound dial.
+	ProxyTransportDialTimeout time.Duration
+	// ProxyTransportTLSHandshakeTimeout bounds the upstream TLS handshake.
+	ProxyTransportTLSHandshakeTimeout time.Duration
+	// ProxyTransportResponseHeaderTimeout bounds waiting for upstream response
+	// headers. Body transfer is not covered.
+	ProxyTransportResponseHeaderTimeout time.Duration
+	// ProxyTransportKeepAlivePeriod is the TCP keep-alive probe interval for
+	// direct (bypass) connections. Connections through a node are configured by
+	// sing-box and are not affected by this setting.
+	ProxyTransportKeepAlivePeriod time.Duration
+	ProxyBypassRules              []string
 	ForwardStickyAccount                            platform.ForwardStickyAccount
 
 	// Request log
@@ -126,7 +137,25 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.NodeDNSUpstreams = envStringSlice("RESIN_NODE_DNS_UPSTREAMS", DefaultNodeDNSUpstreams(), &errs)
 	cfg.ProxyTransportMaxIdleConns = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS", 1024, &errs)
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
-	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
+	// 45s keeps the pool below the ~60s idle cutoff most upstreams apply, so a
+	// connection the peer already forgot about is retired here rather than being
+	// handed to the next request.
+	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 45*time.Second, &errs)
+	// Bounds TCP connection establishment only, not TLS or first byte, so it
+	// must stay well below any end-to-end budget (RESIN_PROBE_TIMEOUT is 15s
+	// for the whole probe) — otherwise a slow hop cannot be told apart from a
+	// dead one. Raise it only for nodes with genuinely high connect latency.
+	cfg.ProxyTransportDialTimeout = envDuration("RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT", 10*time.Second, &errs)
+	cfg.ProxyTransportTLSHandshakeTimeout = envDuration(
+		"RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT", 10*time.Second, &errs)
+	// Bounds the wait for response headers only, not body transfer, so SSE and
+	// large downloads are unaffected. The risk it guards against is slow-first-
+	// byte upstreams (long polling, batch APIs), where a false 502 breaks
+	// working traffic — so the default is generous and 0 disables it entirely.
+	cfg.ProxyTransportResponseHeaderTimeout = envDuration(
+		"RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT", 60*time.Second, &errs)
+	cfg.ProxyTransportKeepAlivePeriod = envDuration(
+		"RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD", 30*time.Second, &errs)
 	cfg.ProxyBypassRules = envDelimitedStringSlice("RESIN_PROXY_BYPASS", []string{})
 	rawForwardStickyAccount := envStr("RESIN_FORWARD_STICKY_ACCOUNT", "")
 	forwardStickyAccount, forwardStickyOK := platform.NormalizeForwardStickyAccount(rawForwardStickyAccount)
@@ -322,6 +351,20 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	validatePositive("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", cfg.ProxyTransportMaxIdleConnsPerHost, &errs)
 	if cfg.ProxyTransportIdleConnTimeout <= 0 {
 		errs = append(errs, "RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT must be positive")
+	}
+	if cfg.ProxyTransportDialTimeout <= 0 {
+		errs = append(errs, "RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT must be positive")
+	}
+	if cfg.ProxyTransportTLSHandshakeTimeout <= 0 {
+		errs = append(errs, "RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT must be positive")
+	}
+	// ResponseHeaderTimeout allows 0, which disables the limit entirely; a
+	// negative value is rejected rather than silently becoming the default.
+	if cfg.ProxyTransportResponseHeaderTimeout < 0 {
+		errs = append(errs, "RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT must not be negative (0 disables it)")
+	}
+	if cfg.ProxyTransportKeepAlivePeriod <= 0 {
+		errs = append(errs, "RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD must be positive")
 	}
 	if cfg.ProxyTransportMaxIdleConnsPerHost > cfg.ProxyTransportMaxIdleConns {
 		errs = append(

@@ -9,9 +9,14 @@ import (
 
 // HealthRecorder abstracts passive health feedback reporting.
 // topology.GlobalNodePool satisfies this interface.
+//
+// RecordLatency is reserved for proactive probes: it advances the node's
+// probe-attempt timestamps. Traffic-path latency samples must go through
+// RecordPassiveLatency, which leaves probe scheduling untouched.
 type HealthRecorder interface {
 	RecordResult(hash node.Hash, success bool)
 	RecordLatency(hash node.Hash, rawTarget string, latency *time.Duration)
+	RecordPassiveLatency(hash node.Hash, rawTarget string, latency *time.Duration)
 }
 
 type passiveHealthRecorder interface {
