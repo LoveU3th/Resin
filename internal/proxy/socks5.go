@@ -12,6 +12,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/outbound"
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 )
 
@@ -45,14 +46,18 @@ type Socks5InboundConfig struct {
 	Events           EventEmitter
 	MetricsSink      MetricsEventSink
 	ProxyBypassRules []string
+	// StickyAccountSource derives the sticky account from the request target
+	// when the client supplies no account. See platform.NormalizeForwardStickyAccount.
+	StickyAccountSource string
 }
 
 // Socks5Inbound implements SOCKS5 CONNECT over a raw TCP connection.
 type Socks5Inbound struct {
-	token       string
-	authVersion config.AuthVersion
-	tunnel      tunnelDeps
-	events      EventEmitter
+	token               string
+	authVersion         config.AuthVersion
+	tunnel              tunnelDeps
+	events              EventEmitter
+	stickyAccountSource platform.ForwardStickyAccount
 }
 
 type socks5HandshakeResult struct {
@@ -72,9 +77,11 @@ func NewSocks5Inbound(cfg Socks5InboundConfig) *Socks5Inbound {
 	if authVersion == "" {
 		authVersion = config.AuthVersionLegacyV0
 	}
+	stickyAccountSource, _ := platform.NormalizeForwardStickyAccount(cfg.StickyAccountSource)
 	return &Socks5Inbound{
-		token:       cfg.ProxyToken,
-		authVersion: authVersion,
+		token:               cfg.ProxyToken,
+		authVersion:         authVersion,
+		stickyAccountSource: stickyAccountSource,
 		tunnel: tunnelDeps{
 			router:      cfg.Router,
 			pool:        cfg.Pool,
@@ -120,15 +127,17 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		ProxyTypeSocks5Forward,
 		true,
 	)
+	account := resolveForwardStickyAccount(s.stickyAccountSource, handshake.account, handshake.target)
+
 	lifecycle.setTarget(handshake.target, "")
-	lifecycle.setAccount(handshake.account)
+	lifecycle.setAccount(account)
 	defer lifecycle.finish()
 
 	prepare := prepareConnectTunnel(
 		baseCtx,
 		s.tunnel,
 		handshake.platformName,
-		handshake.account,
+		account,
 		handshake.target,
 	)
 	if prepare.route.PlatformID != "" {

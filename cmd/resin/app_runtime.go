@@ -424,16 +424,17 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 	}
 
 	forwardProxy := proxy.NewForwardProxy(proxy.ForwardProxyConfig{
-		ProxyToken:        a.envCfg.ProxyToken,
-		AuthVersion:       string(a.envCfg.AuthVersion),
-		Router:            a.topoRuntime.router,
-		Pool:              a.topoRuntime.pool,
-		Health:            a.topoRuntime.pool,
-		Events:            proxyEvents,
-		MetricsSink:       a.metricsManager,
-		OutboundTransport: outboundTransportCfg,
-		TransportPool:     a.transportPool,
-		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		ProxyToken:          a.envCfg.ProxyToken,
+		AuthVersion:         string(a.envCfg.AuthVersion),
+		Router:              a.topoRuntime.router,
+		Pool:                a.topoRuntime.pool,
+		Health:              a.topoRuntime.pool,
+		Events:              proxyEvents,
+		MetricsSink:         a.metricsManager,
+		OutboundTransport:   outboundTransportCfg,
+		TransportPool:       a.transportPool,
+		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
+		StickyAccountSource: string(a.envCfg.ForwardStickyAccount),
 	})
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
@@ -451,14 +452,15 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
 	})
 	socks5Inbound := proxy.NewSocks5Inbound(proxy.Socks5InboundConfig{
-		ProxyToken:       a.envCfg.ProxyToken,
-		AuthVersion:      string(a.envCfg.AuthVersion),
-		Router:           a.topoRuntime.router,
-		Pool:             a.topoRuntime.pool,
-		Health:           a.topoRuntime.pool,
-		Events:           proxyEvents,
-		MetricsSink:      a.metricsManager,
-		ProxyBypassRules: a.envCfg.ProxyBypassRules,
+		ProxyToken:          a.envCfg.ProxyToken,
+		AuthVersion:         string(a.envCfg.AuthVersion),
+		Router:              a.topoRuntime.router,
+		Pool:                a.topoRuntime.pool,
+		Health:              a.topoRuntime.pool,
+		Events:              proxyEvents,
+		MetricsSink:         a.metricsManager,
+		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
+		StickyAccountSource: string(a.envCfg.ForwardStickyAccount),
 	})
 
 	inboundHandler := newInboundMux(

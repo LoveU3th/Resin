@@ -360,6 +360,8 @@ RESIN_PORT=2260 \
 
 - **Q: How do I let LAN or localhost targets skip proxy nodes?**
   - **A**: Set `RESIN_PROXY_BYPASS` to a semicolon/comma/newline-separated rule list. Matching requests are dialed directly by Resin instead of through a proxy node. Example: `RESIN_PROXY_BYPASS="localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>"`. Supported rules include exact hosts, `*`/`?` wildcards, CIDR ranges, and `<local>` for hostnames without dots.
+- **Q: How do I keep one site (or one host) on the same egress IP when the client sends no account?**
+  - **A**: Set `RESIN_FORWARD_STICKY_ACCOUNT`. When a forward-proxy (HTTP or SOCKS5) request carries no Account in its credentials, Resin derives the sticky account from the target: `HOST` sticks on the target host (port stripped, lowercased), `DOMAIN` sticks on the target eTLD+1 so all subdomains of one site share an egress IP, and `OFF` (default) keeps per-request random routing. An Account explicitly carried by the client credentials always wins; reverse-proxy account extraction is unaffected.
 - **Q: Startup fails with `RESIN_PROXY_TOKEN` undefined?**
   - **A**: Even if you do not want a proxy password, you must explicitly set it to empty: `RESIN_PROXY_TOKEN=""`. On shells that drop empty environment variables, create a `.env` file with `RESIN_PROXY_TOKEN=`.
 - **Q: Startup fails with `RESIN_AUTH_VERSION` undefined?**

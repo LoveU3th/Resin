@@ -13,6 +13,7 @@ import (
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/outbound"
+	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
 )
 
@@ -28,24 +29,28 @@ type ForwardProxyConfig struct {
 	OutboundTransport OutboundTransportConfig
 	TransportPool     *OutboundTransportPool
 	ProxyBypassRules  []string
+	// StickyAccountSource derives the sticky account from the request target
+	// when the client supplies no account. See platform.NormalizeForwardStickyAccount.
+	StickyAccountSource string
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
 // authentication, HTTP request forwarding, and CONNECT tunneling.
 type ForwardProxy struct {
-	token             string
-	authVersion       config.AuthVersion
-	router            *routing.Router
-	pool              outbound.PoolAccessor
-	health            HealthRecorder
-	events            EventEmitter
-	metricsSink       MetricsEventSink
-	transportConfig   OutboundTransportConfig
-	transportPool     *OutboundTransportPool
-	transportPoolOnce sync.Once
-	directTransport   *http.Transport
-	directOnce        sync.Once
-	bypass            *TargetBypassMatcher
+	token               string
+	authVersion         config.AuthVersion
+	router              *routing.Router
+	pool                outbound.PoolAccessor
+	health              HealthRecorder
+	events              EventEmitter
+	metricsSink         MetricsEventSink
+	transportConfig     OutboundTransportConfig
+	transportPool       *OutboundTransportPool
+	transportPoolOnce   sync.Once
+	directTransport     *http.Transport
+	directOnce          sync.Once
+	bypass              *TargetBypassMatcher
+	stickyAccountSource platform.ForwardStickyAccount
 }
 
 // NewForwardProxy creates a new forward proxy handler.
@@ -63,18 +68,29 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 	if authVersion == "" {
 		authVersion = config.AuthVersionLegacyV0
 	}
+	stickyAccountSource, _ := platform.NormalizeForwardStickyAccount(cfg.StickyAccountSource)
 	return &ForwardProxy{
-		token:           cfg.ProxyToken,
-		authVersion:     authVersion,
-		router:          cfg.Router,
-		pool:            cfg.Pool,
-		health:          cfg.Health,
-		events:          ev,
-		metricsSink:     cfg.MetricsSink,
-		transportConfig: transportCfg,
-		transportPool:   transportPool,
-		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		token:               cfg.ProxyToken,
+		authVersion:         authVersion,
+		router:              cfg.Router,
+		pool:                cfg.Pool,
+		health:              cfg.Health,
+		events:              ev,
+		metricsSink:         cfg.MetricsSink,
+		transportConfig:     transportCfg,
+		transportPool:       transportPool,
+		bypass:              NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		stickyAccountSource: stickyAccountSource,
 	}
+}
+
+// applyStickyAccountSource fills in the sticky account from the request target
+// when the client did not provide one.
+func (p *ForwardProxy) applyStickyAccountSource(account, target string) string {
+	if p == nil {
+		return account
+	}
+	return resolveForwardStickyAccount(p.stickyAccountSource, account, target)
 }
 
 func (p *ForwardProxy) outboundHTTPTransport(routed routedOutbound) *http.Transport {
@@ -311,6 +327,8 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	account = p.applyStickyAccountSource(account, r.Host)
+
 	lifecycle := newRequestLifecycle(p.events, r, ProxyTypeForward, false)
 	lifecycle.setTarget(r.Host, r.URL.String())
 	defer lifecycle.finish()
@@ -408,6 +426,7 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, authErr)
 		return
 	}
+	account = p.applyStickyAccountSource(account, target)
 
 	lifecycle := newRequestLifecycle(p.events, r, ProxyTypeForward, true)
 	lifecycle.setTarget(target, "")

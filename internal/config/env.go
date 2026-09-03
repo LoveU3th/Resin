@@ -46,6 +46,7 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
 	ProxyBypassRules                                []string
+	ForwardStickyAccount                            platform.ForwardStickyAccount
 
 	// Request log
 	RequestLogQueueSize           int
@@ -127,6 +128,18 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
 	cfg.ProxyBypassRules = envDelimitedStringSlice("RESIN_PROXY_BYPASS", []string{})
+	rawForwardStickyAccount := envStr("RESIN_FORWARD_STICKY_ACCOUNT", "")
+	forwardStickyAccount, forwardStickyOK := platform.NormalizeForwardStickyAccount(rawForwardStickyAccount)
+	if !forwardStickyOK {
+		errs = append(errs, fmt.Sprintf(
+			"RESIN_FORWARD_STICKY_ACCOUNT: invalid value %q (allowed: %s, %s, %s)",
+			rawForwardStickyAccount,
+			platform.ForwardStickyAccountOff,
+			platform.ForwardStickyAccountHost,
+			platform.ForwardStickyAccountDomain,
+		))
+	}
+	cfg.ForwardStickyAccount = forwardStickyAccount
 
 	// --- Request log ---
 	cfg.RequestLogQueueSize = envInt("RESIN_REQUEST_LOG_QUEUE_SIZE", 8192, &errs)

@@ -346,6 +346,8 @@ RESIN_PORT=2260 \
 
 - **Q: 如何让内网或本机目标不走代理节点？**
   - **A**: 配置 `RESIN_PROXY_BYPASS`，用分号、逗号或换行分隔规则。命中的请求会由 Resin 本机直连目标，而不是通过代理节点。例如：`RESIN_PROXY_BYPASS="localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>"`。规则支持精确主机、`*`/`?` 通配符、CIDR 网段，以及表示无点号本地域名的 `<local>`。
+- **Q: 想让同一个站点（或同一个主机）始终走同一个出口 IP，但客户端不带账号，怎么办？**
+  - **A**: 配置 `RESIN_FORWARD_STICKY_ACCOUNT`。正向代理（HTTP 与 SOCKS5）在客户端未提供 Account 时，会用目标地址派生粘性 Account：`HOST` 按目标主机（剥端口、转小写）粘，`DOMAIN` 按 eTLD+1 粘（同一站点的所有子域共用一个出口 IP），`OFF`（默认）保持每请求随机选节点。客户端凭证里显式带的 Account 优先级最高，反向代理的 Account 提取不受影响。
 - **Q: 启动失败提示 `RESIN_PROXY_TOKEN` 未定义？**
   - **A**: 就算你不打算启用代理密码，也必须显式配置它为空：`RESIN_PROXY_TOKEN=""`。如果你的 shell 会丢弃空环境变量，请创建 `.env` 文件并写入 `RESIN_PROXY_TOKEN=`。
 - **Q: 启动失败提示 `RESIN_AUTH_VERSION` 未定义？**

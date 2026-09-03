@@ -2302,6 +2302,11 @@ GeoIP 与订阅的下载都有错误重试的需求。
   * 支持：`local`、`udp://host[:port]`、`tcp://host[:port]`、`tls://host[:port]?sni=name`、`quic://host[:port]?sni=name`、`https://host[:port][/path]?sni=name&bootstrap=local`、`h3://host[:port][/path]?sni=name&bootstrap=local`。
   * 默认端口由传输类型决定：UDP/TCP 为 53，DoT/DoQ 为 853，DoH/H3 为 443；DoH/H3 默认路径为 `/dns-query`。
 * `RESIN_PROXY_BYPASS`：不走代理节点的目标规则，默认空。用分号、逗号或换行分隔；命中规则的 HTTP 正向代理、SOCKS5 正向代理与反向代理请求会由 Resin 本机直连目标。支持精确主机、`*`/`?` 通配符、CIDR 网段与 `<local>`（无点号本地域名），例如 `localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>`。
+* `RESIN_FORWARD_STICKY_ACCOUNT`：正向代理（HTTP 与 SOCKS5）在客户端未提供 Account 时，粘性 Account 的来源。枚举：`OFF|HOST|DOMAIN`（大小写不敏感，允许 `$` 前缀，非法值拒绝启动）。默认 `OFF`。仅作用于正向代理，不影响反向代理的 Account 提取。
+  * `OFF`：维持默认行为——空 Account 表示每请求随机选节点，不粘。
+  * `HOST`：Account 取目标主机（剥离端口、转小写、IPv6 规范化），同一主机共用同一出口 IP。
+  * `DOMAIN`：Account 取目标 eTLD+1（基于 Public Suffix List，IP / 无点号主机名回退为原主机），同一站点的所有子域共用同一出口 IP。
+  * 客户端凭证中显式携带的 Account 优先级最高，因此配置后每个客户端的身份仍然可用。
 
 日志相关配置：
 * `RESIN_REQUEST_LOG_QUEUE_SIZE`：日志写入队列大小。至少是 RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE 的两倍。默认 8192。
