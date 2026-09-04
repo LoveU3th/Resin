@@ -34,6 +34,10 @@ type Router struct {
 	p2cWindow       func() time.Duration
 	onLeaseEvent    LeaseEventFunc
 	nodeTagResolver func(node.Hash) string
+	// Health tuning, all optional: nil means health does not affect routing.
+	healthPenaltyMs              func() int
+	healthFilterThresholdPercent func() int
+	healthMinSamplesForFilter    func() int
 }
 
 type RouterConfig struct {
@@ -45,17 +49,42 @@ type RouterConfig struct {
 	// NodeTagResolver resolves a node hash to its display tag ("<Sub>/<Tag>").
 	// If nil, NodeTag will be empty.
 	NodeTagResolver func(node.Hash) string
+	// Health tuning for node scoring. All optional; nil leaves health out of
+	// routing decisions entirely.
+	HealthPenaltyMs              func() int
+	HealthFilterThresholdPercent func() int
+	HealthMinSamplesForFilter    func() int
 }
 
 func NewRouter(cfg RouterConfig) *Router {
 	return &Router{
-		pool:            cfg.Pool,
-		states:          xsync.NewMap[string, *PlatformRoutingState](),
-		authorities:     cfg.Authorities,
-		p2cWindow:       cfg.P2CWindow,
-		onLeaseEvent:    cfg.OnLeaseEvent,
-		nodeTagResolver: cfg.NodeTagResolver,
+		pool:                         cfg.Pool,
+		states:                       xsync.NewMap[string, *PlatformRoutingState](),
+		authorities:                  cfg.Authorities,
+		p2cWindow:                    cfg.P2CWindow,
+		onLeaseEvent:                 cfg.OnLeaseEvent,
+		nodeTagResolver:              cfg.NodeTagResolver,
+		healthPenaltyMs:              cfg.HealthPenaltyMs,
+		healthFilterThresholdPercent: cfg.HealthFilterThresholdPercent,
+		healthMinSamplesForFilter:    cfg.HealthMinSamplesForFilter,
 	}
+}
+
+// healthWeights reads the current health tuning. Nil accessors yield zero
+// values, which disable the corresponding behaviour.
+func (r *Router) healthWeights() HealthWeights {
+	var w HealthWeights
+	if r.healthPenaltyMs != nil {
+		// Scoring works in nanoseconds, so convert the configured milliseconds.
+		w.PenaltyNs = float64(r.healthPenaltyMs()) * float64(time.Millisecond)
+	}
+	if r.healthFilterThresholdPercent != nil {
+		w.FilterThresholdPercent = r.healthFilterThresholdPercent()
+	}
+	if r.healthMinSamplesForFilter != nil {
+		w.MinSamplesForFilter = r.healthMinSamplesForFilter()
+	}
+	return w
 }
 
 type RouteResult struct {
@@ -395,7 +424,7 @@ func (r *Router) selectLiveRandomRoute(
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
-		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow())
+		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), r.healthWeights())
 		if err != nil {
 			return node.Zero, nil, err
 		}

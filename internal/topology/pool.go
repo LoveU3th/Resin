@@ -50,6 +50,8 @@ type GlobalNodePool struct {
 	maxConsecutiveFailures func() int
 	latencyDecayWindow     func() time.Duration
 	latencyAuthorities     func() []string
+	healthEwmaWindow       func() int
+	healthEwmaMinSamples   func() int
 }
 
 // PoolConfig configures the GlobalNodePool.
@@ -65,6 +67,10 @@ type PoolConfig struct {
 	MaxConsecutiveFailures func() int
 	LatencyDecayWindow     func() time.Duration
 	LatencyAuthorities     func() []string
+	// HealthEwmaWindow and HealthEwmaMinSamples tune the per-node success-ratio
+	// EWMA. Both are optional; node defaults apply when nil or non-positive.
+	HealthEwmaWindow     func() int
+	HealthEwmaMinSamples func() int
 }
 
 var (
@@ -94,6 +100,8 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		maxConsecutiveFailures: maxConsecutiveFailuresFn,
 		latencyDecayWindow:     cfg.LatencyDecayWindow,
 		latencyAuthorities:     cfg.LatencyAuthorities,
+		healthEwmaWindow:       cfg.HealthEwmaWindow,
+		healthEwmaMinSamples:   cfg.HealthEwmaMinSamples,
 		platformByID:           make(map[string]*platform.Platform),
 		platformByName:         make(map[string]*platform.Platform),
 	}
@@ -520,6 +528,7 @@ func (p *GlobalNodePool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {
 // RecordResult records a probe or passive health-check result.
 // On success, resets FailureCount and clears circuit-breaker.
 // On failure, increments FailureCount and opens circuit-breaker if threshold is reached.
+// Every result is also folded into the node's health score.
 // Notifies platforms only when circuit state changes (open/recover).
 // Fires OnNodeDynamicChanged only when dynamic fields actually change.
 func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
@@ -551,6 +560,11 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 		}
 	}
 
+	// Health score is folded in alongside the breaker bookkeeping, but is not
+	// derived from it: the breaker only sees consecutive failures, which says
+	// nothing about a node that fails intermittently and never trips it.
+	entry.RecordHealthSample(success, 1, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
+
 	if circuitStateChanged {
 		p.notifyAllPlatformsDirty(hash)
 	}
@@ -560,12 +574,27 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 }
 
 // RecordPassiveResult records health feedback from user proxy traffic.
-// Failed passive traffic is ignored when the originating platform disables
-// passive circuit breaking; successes still count as positive health feedback.
+//
+// The passive-circuit-breaker switch governs only whether a failure can trip
+// the breaker. The health score always sees the result: a platform that opts
+// out of passive tripping is precisely the one that most needs to know a node
+// is unhealthy, because it will not remove the node on its own. Otherwise such
+// a platform would only ever see probe results — and probes are exactly what
+// reports "reachable" for a node that breaks on real traffic.
 func (p *GlobalNodePool) RecordPassiveResult(platformID string, hash node.Hash, success bool) {
 	if success || !p.passiveCircuitBreakerDisabled(platformID) {
+		// RecordResult folds this into the health score too.
 		p.RecordResult(hash, success)
+		return
 	}
+
+	// Failure on a platform that opted out: keep it away from the breaker, but
+	// let the health score see it.
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+	entry.RecordHealthSample(false, 1, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
 }
 
 func (p *GlobalNodePool) passiveCircuitBreakerDisabled(platformID string) bool {
@@ -585,6 +614,23 @@ func (p *GlobalNodePool) passiveCircuitBreakerDisabled(platformID string) bool {
 
 func (p *GlobalNodePool) currentMaxConsecutiveFailures() int {
 	return p.maxConsecutiveFailures()
+}
+
+// currentHealthEwmaWindow and currentHealthEwmaMinSamples read the health EWMA
+// tuning. They are optional, so a missing or non-positive value falls through
+// to the node package's defaults rather than disabling the score.
+func (p *GlobalNodePool) currentHealthEwmaWindow() int {
+	if p.healthEwmaWindow == nil {
+		return 0
+	}
+	return p.healthEwmaWindow()
+}
+
+func (p *GlobalNodePool) currentHealthEwmaMinSamples() int {
+	if p.healthEwmaMinSamples == nil {
+		return 0
+	}
+	return p.healthEwmaMinSamples()
 }
 
 // RecordLatency records a proactive latency probe attempt for the given node and raw target.

@@ -1,6 +1,7 @@
 package node
 
 import (
+	"math"
 	"net/netip"
 	"regexp"
 	"testing"
@@ -335,5 +336,150 @@ func TestNodeEntry_GetRegion_UsesStoredThenGeoIPFallback(t *testing.T) {
 	}
 	if geoLookupCalled {
 		t.Fatal("geo lookup should not be called when stored region exists")
+	}
+}
+
+// --- Health score (success-ratio EWMA) ---
+
+func TestHealthScore_StartsFullyHealthy(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	if got := e.HealthScore(); got != 1 {
+		t.Fatalf("initial health: got %v, want 1 (unknown nodes are healthy)", got)
+	}
+	if got := e.HealthSamples(); got != 0 {
+		t.Fatalf("initial samples: got %d, want 0", got)
+	}
+}
+
+// Failures must pull the score down, and successes must bring it back up.
+// A monotonically broken node is what the router needs to see.
+func TestHealthScore_DecaysOnFailureAndRecoversOnSuccess(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	for i := 0; i < 10; i++ {
+		e.RecordHealthSample(false, 1, 20, 5)
+	}
+	failed := e.HealthScore()
+	if failed >= 1 {
+		t.Fatalf("health after 10 failures: got %v, want < 1", failed)
+	}
+	// Cold start (alpha 1/5) applies for the first 5 samples, then alpha 1/20,
+	// which lands around 0.25 after ten consecutive failures.
+	if failed > 0.3 {
+		t.Fatalf("health after 10 failures: got %v, want <= 0.3", failed)
+	}
+
+	for i := 0; i < 40; i++ {
+		e.RecordHealthSample(true, 1, 20, 5)
+	}
+	if got := e.HealthScore(); got < 0.8 {
+		t.Fatalf("health after 40 successes: got %v, want >= 0.8", got)
+	}
+}
+
+// The score must decay per observation, not per unit of time: a node that gets
+// no traffic must keep its score rather than drifting, otherwise a node that is
+// bad (and therefore avoided) freezes at its last score with no way back.
+func TestHealthScore_IsIndependentOfElapsedTime(t *testing.T) {
+	slow := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+	fast := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	for i := 0; i < 6; i++ {
+		slow.RecordHealthSample(false, 1, 20, 5)
+		fast.RecordHealthSample(false, 1, 20, 5)
+	}
+
+	if got, want := slow.HealthScore(), fast.HealthScore(); got != want {
+		t.Fatalf("same observations must give the same score: got %v and %v", got, want)
+	}
+}
+
+// Below the minimum sample count a larger alpha applies, so a fresh node is not
+// still sitting near 1.0 after several failures.
+func TestHealthScore_ColdStartConvergesFaster(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	e.RecordHealthSample(false, 1, 20, 5)
+	after1 := 1 - e.HealthScore()
+
+	// With the steady-state alpha (1/20) a single failure would move the score
+	// by 0.05; cold start should move it noticeably more.
+	if after1 <= 0.05 {
+		t.Fatalf("first failure moved health by %v, want > 0.05 (cold-start alpha)", after1)
+	}
+}
+
+// A partial-weight observation (a transfer-phase drop, say) must count for less
+// than a full failure.
+func TestHealthScore_WeightScalesTheObservation(t *testing.T) {
+	full := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+	half := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	full.RecordHealthSample(false, 1, 20, 5)
+	half.RecordHealthSample(false, 0.5, 20, 5)
+
+	if half.HealthScore() <= full.HealthScore() {
+		t.Fatalf("weighted failure (%v) must be less severe than full failure (%v)",
+			half.HealthScore(), full.HealthScore())
+	}
+}
+
+// Out-of-range weights are clamped rather than corrupting the score.
+func TestHealthScore_ClampsWeightAndScore(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	e.RecordHealthSample(false, 5, 20, 5)
+	if got := e.HealthScore(); got < 0 || got > 1 {
+		t.Fatalf("health out of range after weight > 1: got %v", got)
+	}
+
+	e.RecordHealthSample(false, 0, 20, 5)
+	e.RecordHealthSample(false, -1, 20, 5)
+	if got := e.HealthScore(); got < 0 || got > 1 {
+		t.Fatalf("health out of range after non-positive weight: got %v", got)
+	}
+}
+
+func TestHealthScore_ResetHealth(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+	for i := 0; i < 10; i++ {
+		e.RecordHealthSample(false, 1, 20, 5)
+	}
+
+	e.ResetHealth(0.6)
+	// The score is stored as float32, so compare with a tolerance.
+	if got := e.HealthScore(); math.Abs(got-0.6) > 1e-6 {
+		t.Fatalf("health after reset: got %v, want 0.6", got)
+	}
+	if got := e.HealthSamples(); got != 0 {
+		t.Fatalf("samples after reset: got %d, want 0", got)
+	}
+}
+
+// Concurrent sampling must not lose updates or drive the score out of range.
+func TestHealthScore_ConcurrentSamples(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+
+	const goroutines = 16
+	const perGoroutine = 50
+	done := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func(fail bool) {
+			defer func() { done <- struct{}{} }()
+			for j := 0; j < perGoroutine; j++ {
+				e.RecordHealthSample(fail, 1, 20, 5)
+			}
+		}(i%2 == 0)
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+
+	if got := e.HealthScore(); got < 0 || got > 1 {
+		t.Fatalf("health out of range after concurrent sampling: got %v", got)
+	}
+	if got, want := e.HealthSamples(), uint32(goroutines*perGoroutine); got != want {
+		t.Fatalf("samples: got %d, want %d (updates were lost)", got, want)
 	}
 }

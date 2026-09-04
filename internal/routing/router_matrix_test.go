@@ -144,6 +144,7 @@ func TestRandomRoute_SingleNodeTrustsViewWithoutPoolValidation(t *testing.T) {
 		"example.com",
 		[]string{"cloudflare.com"},
 		10*time.Minute,
+		HealthWeights{},
 	)
 	if err != nil {
 		t.Fatalf("randomRoute failed: %v", err)

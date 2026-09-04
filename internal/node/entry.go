@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"math"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -36,6 +37,13 @@ type NodeEntry struct {
 	egressIP         atomic.Pointer[netip.Addr] // nil before first store
 	egressRegion     atomic.Pointer[string]     // lowercase country code from probe trace; nil when unknown
 	LastEgressUpdate atomic.Int64               // unix-nano of last successful egress-IP sample
+	// Health score: EWMA of the success ratio, in [0, 1]. Stored as float32
+	// bits so it can be read and updated with a single atomic operation —
+	// the traffic path must not take a lock for this.
+	healthBits atomic.Uint32
+	// healthSamples counts observations behind the score, saturating at
+	// MaxUint32. Used to gate cold-start convergence and hard filtering.
+	healthSamples atomic.Uint32
 	// Probe-attempt timestamps (unix-nano). These are updated regardless of
 	// probe success/failure, and are used by probe schedulers.
 	LastLatencyProbeAttempt          atomic.Int64
@@ -57,10 +65,122 @@ func NewNodeEntry(hash Hash, rawOptions json.RawMessage, createdAt time.Time, ma
 		RawOptions: rawOptions,
 		CreatedAt:  createdAt,
 	}
+	// Unknown nodes are treated as healthy until observations say otherwise.
+	e.healthBits.Store(math.Float32bits(1))
 	if maxLatencyTableEntries > 0 {
 		e.LatencyTable = NewLatencyTable(maxLatencyTableEntries)
 	}
 	return e
+}
+
+// --- Health score (success-ratio EWMA) ---
+
+const (
+	// DefaultHealthEwmaWindow is how many observations the score effectively
+	// spans: alpha = 1/window.
+	DefaultHealthEwmaWindow = 20
+	// DefaultHealthEwmaMinSamples is the count below which a larger alpha is
+	// used, so a fresh node converges quickly instead of sitting near its
+	// initial 1.0 after several failures.
+	DefaultHealthEwmaMinSamples = 5
+)
+
+// HealthScore returns the success-ratio EWMA in [0, 1]. 1 means recent
+// observations all succeeded, 0 that they all failed.
+//
+// The score is stored as float32, so a fully recovered node converges to about
+// 1 - 6e-7 rather than exactly 1: below 1.0 the float32 spacing is 2^-24, and
+// once the remaining step (alpha * delta) drops under half that spacing the
+// value stops moving. The residue costs roughly a microsecond of routing
+// penalty — far below the tens-of-milliseconds latencies it competes with, so
+// it does not justify a wider type here.
+func (e *NodeEntry) HealthScore() float64 {
+	return float64(math.Float32frombits(e.healthBits.Load()))
+}
+
+// HealthSamples returns how many observations back the score, saturating at
+// math.MaxUint32.
+func (e *NodeEntry) HealthSamples() uint32 {
+	return e.healthSamples.Load()
+}
+
+// ResetHealth restores the score to fully healthy and drops the sample count.
+// Used when a circuit breaker closes, so a recovered node re-enters with a
+// usable score instead of the one that got it isolated. floor, when > 0, sets
+// the score to that value instead of 1.
+func (e *NodeEntry) ResetHealth(floor float64) {
+	next := float32(1)
+	if floor > 0 {
+		next = float32(floor)
+	}
+	e.healthBits.Store(math.Float32bits(next))
+	e.healthSamples.Store(0)
+}
+
+// RecordHealthSample folds one observation into the health score.
+//
+// The EWMA decays per observation, not per unit of time. A time-decayed score
+// would stall for a cold node (say one request an hour) and be dominated by
+// the last few minutes for a hot one — worse, a bad node becomes cold precisely
+// because traffic is being steered away from it, so it would be stranded at its
+// last score with no new evidence to recover from. Counting observations makes
+// "failed 8 of the last 20 requests" mean the same thing regardless of rate.
+//
+// weight scales the observation's influence, for signals that should count for
+// less than a full failure (a transfer-phase drop, say). Values outside (0, 1]
+// are clamped.
+func (e *NodeEntry) RecordHealthSample(success bool, weight float64, window, minSamples int) {
+	if weight <= 0 {
+		return
+	}
+	if weight > 1 {
+		weight = 1
+	}
+	if window <= 0 {
+		window = DefaultHealthEwmaWindow
+	}
+	if minSamples <= 0 {
+		minSamples = DefaultHealthEwmaMinSamples
+	}
+
+	alpha := float32(1) / float32(window)
+	if e.healthSamples.Load() < uint32(minSamples) {
+		// Cold start: converge faster so the first few failures register.
+		alpha = float32(1) / float32(minSamples)
+	}
+
+	var x float32
+	if success {
+		x = 1
+	}
+	step := alpha * float32(weight)
+
+	for {
+		oldBits := e.healthBits.Load()
+		old := math.Float32frombits(oldBits)
+		next := old + step*(x-old)
+		if next < 0 {
+			next = 0
+		} else if next > 1 {
+			next = 1
+		}
+		nextBits := math.Float32bits(next)
+		if nextBits == oldBits || e.healthBits.CompareAndSwap(oldBits, nextBits) {
+			break
+		}
+	}
+
+	// Saturating increment, retried until it lands. A dropped count would make
+	// a node look newer than it is and keep it on the cold-start alpha.
+	for {
+		samples := e.healthSamples.Load()
+		if samples >= math.MaxUint32 {
+			return
+		}
+		if e.healthSamples.CompareAndSwap(samples, samples+1) {
+			return
+		}
+	}
 }
 
 // SubscriptionIDs returns a copy of the subscription ID slice (thread-safe).

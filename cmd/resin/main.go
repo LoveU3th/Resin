@@ -268,6 +268,12 @@ func newTopologyRuntime(
 		MaxConsecutiveFailures: func() int {
 			return runtimeConfigSnapshot(runtimeCfg).MaxConsecutiveFailures
 		},
+		HealthEwmaWindow: func() int {
+			return runtimeConfigSnapshot(runtimeCfg).HealthEwmaWindow
+		},
+		HealthEwmaMinSamples: func() int {
+			return runtimeConfigSnapshot(runtimeCfg).HealthEwmaMinSamples
+		},
 		LatencyDecayWindow: func() time.Duration {
 			return time.Duration(runtimeConfigSnapshot(runtimeCfg).LatencyDecayWindow)
 		},

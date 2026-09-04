@@ -221,6 +221,44 @@ func TestRecordPassiveResult_DisabledPlatformSkipsFailures(t *testing.T) {
 	}
 }
 
+// A platform that opts out of passive circuit breaking must still have its
+// traffic failures reflected in the health score. Otherwise such a platform
+// only ever sees probe results — and probes report "reachable" for exactly the
+// nodes that break on real traffic, so the score would sit at 1.0 forever.
+func TestRecordPassiveResult_DisabledPlatformStillFeedsHealthScore(t *testing.T) {
+	pool, subMgr := newHealthTestPool(2)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"passive-disabled-health"}`)
+	entry, _ := pool.GetEntry(h)
+	pool.RecordResult(h, true)
+
+	plat := platform.NewPlatform("p1", "NoPassiveBreaker", nil, nil)
+	plat.PassiveCircuitBreakerDisabled = true
+	pool.RegisterPlatform(plat)
+
+	before := entry.HealthScore()
+	for i := 0; i < 5; i++ {
+		pool.RecordPassiveResult(plat.ID, h, false)
+	}
+
+	// The breaker must stay untouched...
+	if got := entry.FailureCount.Load(); got != 0 {
+		t.Fatalf("passive failures must not reach the breaker, failure count=%d", got)
+	}
+	if entry.IsCircuitOpen() {
+		t.Fatal("passive failures must not open circuit when disabled")
+	}
+	// ...but the health score must have seen them.
+	after := entry.HealthScore()
+	if after >= before {
+		t.Fatalf("health score must drop on passive failures: before=%v after=%v", before, after)
+	}
+	// One sample from the initial RecordResult above, plus the five failures.
+	if got := entry.HealthSamples(); got != 6 {
+		t.Fatalf("health samples: got %d, want 6", got)
+	}
+}
+
 func TestRecordPassiveResult_EnabledPlatformCountsFailures(t *testing.T) {
 	pool, subMgr := newHealthTestPool(2)
 	sub := subMgr.Lookup("s1")

@@ -20,6 +20,24 @@ type RuntimeConfig struct {
 	MaxAuthorityLatencyTestInterval Duration `json:"max_authority_latency_test_interval"`
 	MaxEgressTestInterval           Duration `json:"max_egress_test_interval"`
 
+	// Health score: success-ratio EWMA per node.
+	// HealthEwmaWindow is the effective span of the score (alpha = 1/window);
+	// below HealthEwmaMinSamples observations a larger alpha is used so a
+	// fresh node converges fast.
+	HealthEwmaWindow     int `json:"health_ewma_window"`
+	HealthEwmaMinSamples int `json:"health_ewma_min_samples"`
+	// HealthPenaltyMs is added to a node's routing score per unit of
+	// unhealthiness, so a score of 0.5 costs half of this. Additive rather
+	// than multiplicative so that an all-healthy fleet scores exactly as it
+	// did before health was considered.
+	HealthPenaltyMs int `json:"health_penalty_ms"`
+	// Nodes at or below HealthFilterThresholdPercent health are rejected as
+	// P2C candidates once they have at least HealthMinSamplesForFilter
+	// observations. Filtering is best-effort: if every candidate is filtered
+	// out the original pick is used, so routing never fails because of health.
+	HealthFilterThresholdPercent int `json:"health_filter_threshold_percent"`
+	HealthMinSamplesForFilter    int `json:"health_min_samples_for_filter"`
+
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
 	LatencyAuthorities []string `json:"latency_authorities"`
@@ -46,6 +64,11 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		ReverseProxyLogRespBodyMaxBytes:    1024,
 
 		MaxConsecutiveFailures:          3,
+		HealthEwmaWindow:                20,
+		HealthEwmaMinSamples:            5,
+		HealthPenaltyMs:                 2000,
+		HealthFilterThresholdPercent:    40,
+		HealthMinSamplesForFilter:       8,
 		MaxLatencyTestInterval:          Duration(1 * time.Hour),
 		MaxAuthorityLatencyTestInterval: Duration(3 * time.Hour),
 		MaxEgressTestInterval:           Duration(24 * time.Hour),

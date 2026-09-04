@@ -12,6 +12,48 @@ import (
 
 var ErrNoAvailableNodes = errors.New("no available nodes")
 
+// healthFilterAttempts bounds how many extra candidates are drawn when the
+// picked one is unhealthy, so a fleet of bad nodes cannot turn one pick into an
+// unbounded scan.
+const healthFilterAttempts = 3
+
+// HealthWeights controls how strongly node health affects routing.
+// A zero value disables health entirely, leaving scoring as it was before.
+type HealthWeights struct {
+	// PenaltyNs is added to a candidate's score per unit of unhealthiness, in
+	// nanoseconds — scores are built from time.Duration, so the configured
+	// milliseconds must be converted before being stored here. A node at 0.5
+	// health pays half of this.
+	//
+	// It is additive rather than multiplicative on purpose: an all-healthy
+	// fleet then scores exactly as it did before health existed, and the
+	// penalty stays independent of the platform's allocation policy (which may
+	// return 0, making a multiplier ineffective).
+	PenaltyNs float64
+	// FilterThresholdPercent rejects candidates at or below this health, as a
+	// percentage. 0 disables filtering.
+	FilterThresholdPercent int
+	// MinSamplesForFilter gates filtering: a node is never filtered before it
+	// has this many observations, so a fresh node is not dropped on noise.
+	MinSamplesForFilter int
+}
+
+// allows reports whether a node is healthy enough to be a routing candidate.
+// Nodes with too few observations are always allowed through.
+func (w HealthWeights) allows(pool PoolAccessor, h node.Hash) bool {
+	if w.FilterThresholdPercent <= 0 || w.MinSamplesForFilter <= 0 {
+		return true
+	}
+	entry, ok := pool.GetEntry(h)
+	if !ok || entry == nil {
+		return true
+	}
+	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {
+		return true
+	}
+	return entry.HealthScore()*100 >= float64(w.FilterThresholdPercent)
+}
+
 var randomRouteRNGPool = sync.Pool{
 	New: func() any {
 		return rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
@@ -30,6 +72,7 @@ func randomRoute(
 	targetDomain string,
 	authorities []string,
 	p2cWindow time.Duration,
+	health HealthWeights,
 ) (node.Hash, error) {
 	view := plat.View()
 	size := view.Size()
@@ -44,16 +87,39 @@ func randomRoute(
 		return view.RandomPick(rng)
 	}
 
+	// Health filtering is best-effort: if no healthy candidate turns up, the
+	// original pick is kept. Routing must never fail because of health.
+	filter := func(h node.Hash, exclude node.Hash) node.Hash {
+		if health.allows(pool, h) {
+			return h
+		}
+		for i := 0; i < healthFilterAttempts; i++ {
+			candidate, ok := pick()
+			if !ok {
+				break
+			}
+			if candidate == exclude || candidate == h {
+				continue
+			}
+			if health.allows(pool, candidate) {
+				return candidate
+			}
+		}
+		return h
+	}
+
 	// Pick 1st candidate.
 	h1, ok1 := pick()
 	if !ok1 {
 		return node.Zero, ErrNoAvailableNodes
 	}
-
-	// If view has one node, use it directly.
+	// With a single node there is nothing to swap in, so skip filtering
+	// entirely rather than drawing candidates that can only be that node.
 	if size == 1 {
 		return h1, nil
 	}
+
+	h1 = filter(h1, node.Zero)
 
 	// Pick 2nd candidate; best-effort to make it distinct.
 	h2, ok2 := pick()
@@ -75,13 +141,14 @@ func randomRoute(
 			return h1, nil
 		}
 	}
+	h2 = filter(h2, h1)
 
 	// Determine effective latency for comparison.
 	lat1, lat2 := compareLatencies(h1, h2, pool, targetDomain, authorities, p2cWindow)
 
 	// Calculate scores.
-	s1 := calculateScore(h1, lat1, plat, stats, pool)
-	s2 := calculateScore(h2, lat2, plat, stats, pool)
+	s1 := calculateScore(h1, lat1, plat, stats, pool, health)
+	s2 := calculateScore(h2, lat2, plat, stats, pool, health)
 
 	// Lower score is better.
 	selected := h2 // favor h2 on tie
@@ -141,6 +208,7 @@ func calculateScore(
 	plat *platform.Platform,
 	stats *IPLoadStats,
 	pool PoolAccessor,
+	health HealthWeights,
 ) float64 {
 	entry, _ := pool.GetEntry(h)
 	// If entry is nil (race), treat as high load/latency?
@@ -156,21 +224,29 @@ func calculateScore(
 		}
 	}
 
-	// If latency is 0 (empty/incompatible), score = LeaseCount strictly.
+	var score float64
 	if latency <= 0 {
-		return float64(leaseCount)
+		// If latency is 0 (empty/incompatible), score = LeaseCount strictly.
+		score = float64(leaseCount)
+	} else {
+		// Policy-based scoring.
+		switch plat.AllocationPolicy {
+		case platform.AllocationPolicyPreferLowLatency:
+			score = float64(latency)
+		case platform.AllocationPolicyPreferIdleIP:
+			score = float64(leaseCount)
+		case platform.AllocationPolicyBalanced:
+			fallthrough
+		default:
+			// (LeaseCount + 1) * Latency
+			score = float64(leaseCount+1) * float64(latency)
+		}
 	}
 
-	// Policy-based scoring.
-	switch plat.AllocationPolicy {
-	case platform.AllocationPolicyPreferLowLatency:
-		return float64(latency)
-	case platform.AllocationPolicyPreferIdleIP:
-		return float64(leaseCount)
-	case platform.AllocationPolicyBalanced:
-		fallthrough
-	default:
-		// (LeaseCount + 1) * Latency
-		return float64(leaseCount+1) * float64(latency)
+	// Health penalty, applied the same way under every policy. A fully healthy
+	// node adds nothing, so an all-healthy fleet is unaffected.
+	if entry != nil && health.PenaltyNs > 0 {
+		score += (1 - entry.HealthScore()) * health.PenaltyNs
 	}
+	return score
 }

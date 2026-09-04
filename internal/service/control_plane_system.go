@@ -84,6 +84,11 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"reverse_proxy_log_resp_headers_max_bytes": true,
 	"reverse_proxy_log_resp_body_max_bytes":    true,
 	"max_consecutive_failures":                 true,
+	"health_ewma_window":                       true,
+	"health_ewma_min_samples":                  true,
+	"health_penalty_ms":                        true,
+	"health_filter_threshold_percent":          true,
+	"health_min_samples_for_filter":            true,
 	"max_latency_test_interval":                true,
 	"max_authority_latency_test_interval":      true,
 	"max_egress_test_interval":                 true,
@@ -208,6 +213,21 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	latencyDomain := strings.ToLower(netutil.ExtractDomain(u.Host))
 	if cfg.MaxConsecutiveFailures < 0 {
 		return invalidArg("max_consecutive_failures: must be non-negative")
+	}
+	if cfg.HealthEwmaWindow <= 0 {
+		return invalidArg("health_ewma_window: must be positive")
+	}
+	if cfg.HealthEwmaMinSamples <= 0 {
+		return invalidArg("health_ewma_min_samples: must be positive")
+	}
+	if cfg.HealthPenaltyMs < 0 {
+		return invalidArg("health_penalty_ms: must be non-negative")
+	}
+	if cfg.HealthFilterThresholdPercent < 0 || cfg.HealthFilterThresholdPercent > 100 {
+		return invalidArg("health_filter_threshold_percent: must be between 0 and 100")
+	}
+	if cfg.HealthMinSamplesForFilter < 0 {
+		return invalidArg("health_min_samples_for_filter: must be non-negative")
 	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")
