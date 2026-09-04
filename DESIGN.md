@@ -376,8 +376,8 @@ Platform 过滤时，通过 `NodeEntry.MatchRegexs` 方法，反向查询 Refere
 全局节点池提供一组线程安全的健康管理接口，供被动反馈与主动探测调用。这些接口是系统维护节点状态的唯一入口。
 
 * `RecordResult(id NodeHash, success bool)`：提交节点的一次网络请求结果。
-	* `success=true`：重置连续失败计数 (`FailureCount = 0`)。若节点当前处于熔断状态，立即恢复（`清空 CircuitOpenSince`）。
-	* `success=false`：原子递增连续失败计数。若计数达到配置的阈值 (`MaxConsecutiveFailures`)，触发熔断（`CircuitOpenSince = 当前时间`）。
+	* `success=true`：重置连续失败计数 (`FailureCount = 0`)。**仅当熔断冷却期已过**才关闭熔断（`清空 CircuitOpenSince`）；冷却期内的成功只作为健康度反馈，不关闭熔断。
+	* `success=false`：原子递增连续失败计数。若计数达到配置的阈值 (`MaxConsecutiveFailures`)，触发熔断（`CircuitOpenSince = 当前时间`）。若节点已处于半开态，则递增退避计数并延长冷却，但**不重置** `CircuitOpenSince`。
 * `RecordPassiveResult(platformID string, id NodeHash, success bool)`：提交来自用户代理流量的被动网络结果。若对应 Platform 开启 `passive_circuit_breaker_disabled`，则忽略失败结果，不增加连续失败计数；成功结果仍作为正向健康反馈处理。
 * `RecordLatency(id NodeHash, domain string, latency *Duration)`：提交节点对特定域名的**主动探测**尝试。`latency=nil` 表示“仅记录本次探测尝试，不写延迟样本”；`latency!=nil` 时按 TD-EWMA 更新延迟统计。无论 `latency` 是否为空，都会更新 `LastLatencyProbeAttempt`，若域名属于 `LatencyAuthorities` 还会更新 `LastAuthorityLatencyProbeAttempt`。如果调用本次 `RecordLatency` 之前，节点的 `LatencyTable` 为空，需要通知各 Platform 重新过滤这个节点。
 * `RecordPassiveLatency(id NodeHash, domain string, latency *Duration)`：提交来自用户真实流量的被动延迟样本。语义与 `RecordLatency` 一致（含 `latency=nil` 与 TD-EWMA 更新），**但不更新任何探测尝试时间戳**，因此不会影响主动探测的调度。数据面（正向代理、反向代理、CONNECT/SOCKS5 隧道）必须使用此接口。
@@ -389,7 +389,12 @@ Resin 使用计数器熔断机制保护系统稳定性。
 * 熔断触发：仅由 `RecordResult(id, false)` 触发。当连续失败次数 >= 阈值时，节点进入熔断状态。熔断的节点会立即从所有 Platform 的可路由视图中移除，不再承载用户流量。
 	* 用户代理流量通过 `RecordPassiveResult(platformID, id, false)` 上报失败；当对应 Platform 开启 `passive_circuit_breaker_disabled` 时，这类失败不会触发熔断。
 	* 主动探测仍直接使用 `RecordResult(id, false)`，不受 Platform 的 `passive_circuit_breaker_disabled` 影响。
-* 熔断恢复：熔断后的节点依然保留在全局池中，接受 ProbeManager 的主动探测。一旦 `RecordResult(id, true)` 被调用（通常由主动探测触发），节点立即恢复，重新加入可路由视图。
+* 熔断恢复：熔断后的节点依然保留在全局池中，接受 ProbeManager 的主动探测。但**必须等冷却期结束**才能恢复：
+	* 三态：`Closed`（可路由）/ `Open`（冷却未过，即便成功也不恢复）/ `HalfOpen`（冷却已过，可被探测恢复）。HalfOpen 节点仍然不在可路由视图中，只是具备了被探测恢复的资格。
+	* 冷却期内的成功只喂健康度，不关闭熔断。这是钳制振荡频率的关键：否则抖动节点会在「被摘除」与「可路由」之间高频来回。
+	* `scanLatency` 中半开节点**绕过** `MaxLatencyTestInterval` 闸门直接入队。否则冷却期内不会有任何探测，配置成 30s 的冷却实际上要等最多 1 小时才可能被验证，冷却形同虚设。
+	* 半开探测失败则冷却翻倍（`circuit_cooldown` × 2^n，上限 `circuit_max_cooldown`），且 `CircuitOpenSince` 保持不变——冷却始终从首次隔离时刻起算，无需第二个时间戳。
+	* 关闭熔断时把健康度抬到恢复地板（`health_recovery_floor_percent`，默认 60%），高于过滤阈值，避免节点凭旧分数被立刻过滤掉。
 * 熔断逻辑由全局代理池管理。禁止其他模块直接修改节点的熔断状态。
 
 ### 延迟统计 (TD-EWMA)

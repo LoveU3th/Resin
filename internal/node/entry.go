@@ -33,10 +33,24 @@ type NodeEntry struct {
 
 	// Atomic dynamic fields for concurrent hot-path reads.
 	FailureCount     atomic.Int32
-	CircuitOpenSince atomic.Int64               // unix-nano; 0 = not open
-	egressIP         atomic.Pointer[netip.Addr] // nil before first store
-	egressRegion     atomic.Pointer[string]     // lowercase country code from probe trace; nil when unknown
-	LastEgressUpdate atomic.Int64               // unix-nano of last successful egress-IP sample
+	CircuitOpenSince atomic.Int64 // unix-nano; 0 = not open
+	// CircuitReopenCount counts half-open probes that failed. Together with
+	// CircuitOpenSince (which is never reset while the breaker stays open) it
+	// implements exponential backoff without a second timestamp.
+	CircuitReopenCount atomic.Int32
+	// CircuitCooldownNs is the cooldown fixed when the breaker opened, as
+	// base * 2^reopenCount capped at the configured maximum. Freezing it here
+	// means a config change cannot retune a node that is already isolated.
+	//
+	// Not persisted: after a restart the breaker state comes back from
+	// CircuitOpenSince but with no cooldown, so the node takes the
+	// first-isolation path and re-probes at the base cooldown. Losing the
+	// backoff progress is harmless — it only means a chronic node gets probed a
+	// little sooner.
+	CircuitCooldownNs atomic.Int64
+	egressIP          atomic.Pointer[netip.Addr] // nil before first store
+	egressRegion      atomic.Pointer[string]     // lowercase country code from probe trace; nil when unknown
+	LastEgressUpdate  atomic.Int64               // unix-nano of last successful egress-IP sample
 	// Health score: EWMA of the success ratio, in [0, 1]. Stored as float32
 	// bits so it can be read and updated with a single atomic operation —
 	// the traffic path must not take a lock for this.
@@ -316,7 +330,44 @@ func matchesAll(s string, regexes []*regexp.Regexp) bool {
 
 // --- Condition helpers for platform filtering ---
 
+// CircuitState describes where a node's breaker is in its cooldown.
+type CircuitState int
+
+const (
+	// CircuitClosed means the node is routable.
+	CircuitClosed CircuitState = iota
+	// CircuitOpen means the node is isolated and its cooldown has not elapsed,
+	// so even a success must not close the breaker yet.
+	CircuitOpen
+	// CircuitHalfOpen means the cooldown has elapsed: the node is still not
+	// routable, but a probe may now attempt recovery.
+	CircuitHalfOpen
+)
+
+// CircuitStateOf reports the breaker state at the given time.
+func (e *NodeEntry) CircuitState(now time.Time) CircuitState {
+	openedAt := e.CircuitOpenSince.Load()
+	if openedAt == 0 {
+		return CircuitClosed
+	}
+	cooldown := time.Duration(e.CircuitCooldownNs.Load())
+	if cooldown > 0 && now.Sub(time.Unix(0, openedAt)) < cooldown {
+		return CircuitOpen
+	}
+	return CircuitHalfOpen
+}
+
+// IsHalfOpen reports whether the cooldown has elapsed, meaning a probe result
+// may close the breaker. Probe scheduling uses this to bypass the normal
+// interval gate: without it, a node in a 30s cooldown would not be probed for
+// up to an hour, making the cooldown effectively unobservable.
+func (e *NodeEntry) IsHalfOpen() bool {
+	return e.CircuitState(time.Now()) == CircuitHalfOpen
+}
+
 // IsCircuitOpen returns true if the node is currently circuit-broken.
+// It stays true through the half-open phase: a half-open node is still not
+// routable, it is merely eligible to be probed.
 func (e *NodeEntry) IsCircuitOpen() bool {
 	return e.CircuitOpenSince.Load() != 0
 }

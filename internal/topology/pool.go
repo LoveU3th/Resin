@@ -52,6 +52,9 @@ type GlobalNodePool struct {
 	latencyAuthorities     func() []string
 	healthEwmaWindow       func() int
 	healthEwmaMinSamples   func() int
+	circuitCooldown        func() time.Duration
+	circuitMaxCooldown     func() time.Duration
+	healthRecoveryFloorPct func() int
 }
 
 // PoolConfig configures the GlobalNodePool.
@@ -71,6 +74,16 @@ type PoolConfig struct {
 	// EWMA. Both are optional; node defaults apply when nil or non-positive.
 	HealthEwmaWindow     func() int
 	HealthEwmaMinSamples func() int
+	// CircuitCooldown is the minimum time a node stays isolated once its
+	// breaker opens; a success before it elapses feeds the health score but
+	// does not close the breaker. CircuitMaxCooldown caps the exponential
+	// backoff applied on repeated half-open failures. Both optional.
+	CircuitCooldown    func() time.Duration
+	CircuitMaxCooldown func() time.Duration
+	// HealthRecoveryFloor is the health score a node is lifted to when its
+	// breaker closes, as a percentage. It sits above the filter threshold so
+	// the node re-enters routing instead of being filtered out immediately.
+	HealthRecoveryFloorPercent func() int
 }
 
 var (
@@ -102,6 +115,9 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 		latencyAuthorities:     cfg.LatencyAuthorities,
 		healthEwmaWindow:       cfg.HealthEwmaWindow,
 		healthEwmaMinSamples:   cfg.HealthEwmaMinSamples,
+		circuitCooldown:        cfg.CircuitCooldown,
+		circuitMaxCooldown:     cfg.CircuitMaxCooldown,
+		healthRecoveryFloorPct: cfg.HealthRecoveryFloorPercent,
 		platformByID:           make(map[string]*platform.Platform),
 		platformByName:         make(map[string]*platform.Platform),
 	}
@@ -526,11 +542,19 @@ func (p *GlobalNodePool) RangeNodes(fn func(node.Hash, *node.NodeEntry) bool) {
 }
 
 // RecordResult records a probe or passive health-check result.
-// On success, resets FailureCount and clears circuit-breaker.
-// On failure, increments FailureCount and opens circuit-breaker if threshold is reached.
-// Every result is also folded into the node's health score.
-// Notifies platforms only when circuit state changes (open/recover).
-// Fires OnNodeDynamicChanged only when dynamic fields actually change.
+//
+// The breaker is a three-state machine. A failure at or above the consecutive
+// failure threshold isolates the node for at least the configured cooldown;
+// once that elapses the node is half-open and a probe may close the breaker.
+//
+// A success arriving during the cooldown feeds the health score but does NOT
+// close the breaker. That clamp is the whole point: without it a flapping node
+// can rejoin routing on the very next successful request and oscillate between
+// removed and routable many times a minute.
+//
+// Every result is folded into the node's health score. Platforms are notified
+// only when the breaker opens or closes, and OnNodeDynamicChanged fires only
+// when dynamic fields actually change.
 func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
@@ -539,23 +563,60 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 
 	dynamicChanged := false
 	circuitStateChanged := false
+	now := time.Now()
 
 	if success {
 		if entry.FailureCount.Swap(0) != 0 {
 			dynamicChanged = true
 		}
-		if entry.CircuitOpenSince.Swap(0) != 0 {
-			dynamicChanged = true
-			circuitStateChanged = true
+
+		// Only a success at or past the cooldown may close the breaker.
+		if entry.CircuitOpenSince.Load() != 0 && entry.CircuitState(now) != node.CircuitOpen {
+			// Clear the backoff before closing. Reversed, a concurrent failure
+			// could observe openedAt != 0 with a zeroed cooldown and treat the
+			// node as immediately half-open, skipping the cooldown entirely.
+			entry.CircuitReopenCount.Store(0)
+			entry.CircuitCooldownNs.Store(0)
+			if entry.CircuitOpenSince.Swap(0) != 0 {
+				dynamicChanged = true
+				circuitStateChanged = true
+				// Lift the health score to a floor above the filter threshold,
+				// so the node re-enters routing instead of being filtered
+				// straight back out on its stale score.
+				entry.ResetHealth(p.currentHealthRecoveryFloor())
+			}
 		}
 	} else {
 		newCount := entry.FailureCount.Add(1)
 		dynamicChanged = true
 		maxConsecutiveFailures := p.currentMaxConsecutiveFailures()
 		if maxConsecutiveFailures > 0 && int(newCount) >= maxConsecutiveFailures {
-			// Open circuit if not already open.
-			if entry.CircuitOpenSince.CompareAndSwap(0, time.Now().UnixNano()) {
-				circuitStateChanged = true
+			openedAt := entry.CircuitOpenSince.Load()
+			switch {
+			case openedAt == 0 || entry.CircuitCooldownNs.Load() == 0:
+				// First isolation, or the node's initial breaker state: nodes
+				// start out isolated with no cooldown, and that must not count
+				// as a half-open failure or the very first failure would
+				// already back off to twice the base cooldown.
+				entry.CircuitReopenCount.Store(0)
+				entry.CircuitCooldownNs.Store(int64(p.cooldownFor(0)))
+				if openedAt == 0 {
+					if entry.CircuitOpenSince.CompareAndSwap(0, now.UnixNano()) {
+						circuitStateChanged = true
+					}
+				} else {
+					// Restart the clock at this failure. The node is already
+					// outside every platform view, so no notification.
+					entry.CircuitOpenSince.Store(now.UnixNano())
+				}
+			case entry.CircuitState(now) == node.CircuitHalfOpen:
+				// A half-open probe failed. Keep the original open timestamp so
+				// the cooldown is measured from first isolation, and lengthen
+				// it: 30s -> 60s -> 120s...
+				failures := entry.CircuitReopenCount.Add(1)
+				entry.CircuitCooldownNs.Store(int64(p.cooldownFor(failures)))
+			default:
+				// Still inside the cooldown; nothing to change.
 			}
 		}
 	}
@@ -631,6 +692,85 @@ func (p *GlobalNodePool) currentHealthEwmaMinSamples() int {
 		return 0
 	}
 	return p.healthEwmaMinSamples()
+}
+
+const (
+	defaultCircuitCooldown    = 30 * time.Second
+	defaultCircuitMaxCooldown = 30 * time.Minute
+	// defaultHealthRecoveryFloorPercent sits above the default filter
+	// threshold (40) so a recovered node is not immediately filtered out.
+	defaultHealthRecoveryFloorPercent = 60
+	// backoffShiftLimit caps the 2^n growth well below the int64 range.
+	backoffShiftLimit = 40
+)
+
+func (p *GlobalNodePool) currentCircuitCooldown() time.Duration {
+	if p.circuitCooldown == nil {
+		return defaultCircuitCooldown
+	}
+	// 0 is a valid value meaning "no cooldown"; only a negative value (or no
+	// accessor at all) falls back to the default.
+	if d := p.circuitCooldown(); d >= 0 {
+		return d
+	}
+	return defaultCircuitCooldown
+}
+
+func (p *GlobalNodePool) currentCircuitMaxCooldown() time.Duration {
+	if p.circuitMaxCooldown == nil {
+		return defaultCircuitMaxCooldown
+	}
+	if d := p.circuitMaxCooldown(); d >= 0 {
+		return d
+	}
+	return defaultCircuitMaxCooldown
+}
+
+func (p *GlobalNodePool) currentHealthRecoveryFloor() float64 {
+	pct := defaultHealthRecoveryFloorPercent
+	if p.healthRecoveryFloorPct != nil {
+		pct = p.healthRecoveryFloorPct()
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return float64(pct) / 100
+}
+
+// cooldownFor returns base * 2^failures, capped at the configured maximum.
+// The breaker keeps its original open timestamp, so the cooldown is always
+// measured from when the node was first isolated, not from the last failure.
+func (p *GlobalNodePool) cooldownFor(halfOpenFailures int32) time.Duration {
+	base := p.currentCircuitCooldown()
+	if base <= 0 {
+		// Cooldown disabled: never back off into a positive value.
+		return 0
+	}
+	max := p.currentCircuitMaxCooldown()
+	// A maximum that is not configured (0) or that sits below the base is
+	// raised to the base, so the first backoff step always has somewhere to go.
+	if max < base {
+		max = base
+	}
+	if halfOpenFailures <= 0 {
+		return base
+	}
+
+	cooldown := base
+	for i := int32(0); i < halfOpenFailures && i < backoffShiftLimit; i++ {
+		cooldown *= 2
+		// cooldown <= 0 means the shift overflowed; clamp to the maximum.
+		if cooldown >= max || cooldown <= 0 {
+			return max
+		}
+	}
+	if cooldown > max {
+		return max
+	}
+	return cooldown
 }
 
 // RecordLatency records a proactive latency probe attempt for the given node and raw target.

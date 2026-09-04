@@ -974,3 +974,117 @@ func TestParseCloudflareTrace_NoIP(t *testing.T) {
 		t.Fatal("expected error when ip field is missing")
 	}
 }
+
+// newScanTestPool builds a pool backed by one enabled subscription.
+// scanLatency skips nodes that no enabled subscription claims, so a node is
+// only scannable once it is stored in the subscription's managed nodes.
+func newScanTestPool() (*topology.GlobalNodePool, *subscription.Subscription) {
+	subMgr := topology.NewSubscriptionManager()
+	// enabled=true, so nodes are eligible for scanning.
+	sub := subscription.NewSubscription("scan-sub", "scan-sub", "url", true, false)
+	subMgr.Register(sub)
+
+	pool := topology.NewGlobalNodePool(topology.PoolConfig{
+		SubLookup:              subMgr.Lookup,
+		MaxLatencyTableEntries: 16,
+		MaxConsecutiveFailures: func() int { return 3 },
+		CircuitCooldown:        func() time.Duration { return 30 * time.Second },
+	})
+	return pool, sub
+}
+
+func addScanTestNode(
+	t *testing.T,
+	pool *topology.GlobalNodePool,
+	sub *subscription.Subscription,
+	raw string,
+) (node.Hash, *node.NodeEntry) {
+	t.Helper()
+	h := node.HashFromRawOptions([]byte(raw))
+	pool.AddNodeFromSub(h, []byte(raw), sub.ID)
+	sub.ManagedNodes().StoreNode(h, subscription.ManagedNode{Tags: []string{"tag"}})
+
+	entry, ok := pool.GetEntry(h)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	storeOutbound(entry)
+	return h, entry
+}
+
+func newScanTestManager(pool *topology.GlobalNodePool) *ProbeManager {
+	return NewProbeManager(ProbeConfig{
+		Pool:        pool,
+		Concurrency: 1,
+		Fetcher: func(_ node.Hash, _ string) ([]byte, time.Duration, error) {
+			return []byte("OK"), 10 * time.Millisecond, nil
+		},
+		MaxLatencyTestInterval: func() time.Duration { return time.Hour },
+	})
+}
+
+// A half-open node's cooldown has elapsed and it is waiting for a probe to
+// decide whether it can rejoin routing. Gating that probe behind
+// MaxLatencyTestInterval would make the cooldown unobservable: the node would
+// stay isolated for up to an hour no matter how short the cooldown is.
+func TestScanLatency_HalfOpenNodeBypassesIntervalGate(t *testing.T) {
+	pool, sub := newScanTestPool()
+	hash, entry := addScanTestNode(t, pool, sub, `{"type":"half-open"}`)
+
+	// Isolated a minute ago with a 30s cooldown -> the cooldown has elapsed.
+	entry.CircuitOpenSince.Store(time.Now().Add(-time.Minute).UnixNano())
+	entry.CircuitCooldownNs.Store(int64(30 * time.Second))
+	if !entry.IsHalfOpen() {
+		t.Fatalf("precondition: node should be half-open, got %v", entry.CircuitState(time.Now()))
+	}
+	// Probed moments ago, which the normal interval gate would refuse.
+	entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
+
+	mgr := newScanTestManager(pool)
+	mgr.scanLatency()
+
+	done := make(chan probeTask, 1)
+	go func() {
+		if task, ok := mgr.taskQueue.Dequeue(); ok {
+			done <- task
+		}
+	}()
+	select {
+	case task := <-done:
+		if task.key.hash != hash {
+			t.Fatalf("queued the wrong node: got %v want %v", task.key.hash, hash)
+		}
+		if task.key.kind != probeTaskKindLatency {
+			t.Fatalf("task kind: got %v, want latency", task.key.kind)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("half-open node must be queued despite being probed recently")
+	}
+}
+
+// The bypass must be limited to half-open nodes: an ordinary node probed
+// recently stays gated, otherwise every scan would re-probe everything.
+func TestScanLatency_RecentlyProbedNodeStaysGated(t *testing.T) {
+	pool, sub := newScanTestPool()
+	_, entry := addScanTestNode(t, pool, sub, `{"type":"recent"}`)
+
+	// Not isolated, and probed moments ago.
+	entry.CircuitOpenSince.Store(0)
+	entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
+
+	mgr := newScanTestManager(pool)
+	mgr.scanLatency()
+
+	done := make(chan probeTask, 1)
+	go func() {
+		if task, ok := mgr.taskQueue.Dequeue(); ok {
+			done <- task
+		}
+	}()
+	select {
+	case task := <-done:
+		t.Fatalf("recently probed node should not be queued, got %v", task.key)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: nothing queued.
+	}
+}

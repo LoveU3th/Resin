@@ -37,6 +37,18 @@ type RuntimeConfig struct {
 	// out the original pick is used, so routing never fails because of health.
 	HealthFilterThresholdPercent int `json:"health_filter_threshold_percent"`
 	HealthMinSamplesForFilter    int `json:"health_min_samples_for_filter"`
+	// CircuitCooldown is the minimum time a node stays isolated once its
+	// breaker opens: a success before it elapses feeds the health score but
+	// does not rejoin routing, which is what clamps how fast a flapping node
+	// can oscillate. 0 disables the cooldown.
+	CircuitCooldown Duration `json:"circuit_cooldown"`
+	// CircuitMaxCooldown caps the exponential backoff applied each time a
+	// half-open probe fails (30s -> 60s -> 120s...).
+	CircuitMaxCooldown Duration `json:"circuit_max_cooldown"`
+	// HealthRecoveryFloorPercent is the health score a node is lifted to when
+	// its breaker closes. It sits above the filter threshold so the node
+	// re-enters routing instead of being filtered straight back out.
+	HealthRecoveryFloorPercent int `json:"health_recovery_floor_percent"`
 
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
@@ -69,6 +81,9 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		HealthPenaltyMs:                 2000,
 		HealthFilterThresholdPercent:    40,
 		HealthMinSamplesForFilter:       8,
+		CircuitCooldown:                 Duration(30 * time.Second),
+		CircuitMaxCooldown:              Duration(30 * time.Minute),
+		HealthRecoveryFloorPercent:      60,
 		MaxLatencyTestInterval:          Duration(1 * time.Hour),
 		MaxAuthorityLatencyTestInterval: Duration(3 * time.Hour),
 		MaxEgressTestInterval:           Duration(24 * time.Hour),

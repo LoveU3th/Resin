@@ -274,6 +274,15 @@ func newTopologyRuntime(
 		HealthEwmaMinSamples: func() int {
 			return runtimeConfigSnapshot(runtimeCfg).HealthEwmaMinSamples
 		},
+		CircuitCooldown: func() time.Duration {
+			return time.Duration(runtimeConfigSnapshot(runtimeCfg).CircuitCooldown)
+		},
+		CircuitMaxCooldown: func() time.Duration {
+			return time.Duration(runtimeConfigSnapshot(runtimeCfg).CircuitMaxCooldown)
+		},
+		HealthRecoveryFloorPercent: func() int {
+			return runtimeConfigSnapshot(runtimeCfg).HealthRecoveryFloorPercent
+		},
 		LatencyDecayWindow: func() time.Duration {
 			return time.Duration(runtimeConfigSnapshot(runtimeCfg).LatencyDecayWindow)
 		},

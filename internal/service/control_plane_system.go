@@ -89,6 +89,9 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"health_penalty_ms":                        true,
 	"health_filter_threshold_percent":          true,
 	"health_min_samples_for_filter":            true,
+	"circuit_cooldown":                         true,
+	"circuit_max_cooldown":                     true,
+	"health_recovery_floor_percent":            true,
 	"max_latency_test_interval":                true,
 	"max_authority_latency_test_interval":      true,
 	"max_egress_test_interval":                 true,
@@ -228,6 +231,19 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.HealthMinSamplesForFilter < 0 {
 		return invalidArg("health_min_samples_for_filter: must be non-negative")
+	}
+	// 0 disables the cooldown, so only a negative value is rejected.
+	if cfg.CircuitCooldown < 0 {
+		return invalidArg("circuit_cooldown: must not be negative (0 disables it)")
+	}
+	if cfg.CircuitMaxCooldown < 0 {
+		return invalidArg("circuit_max_cooldown: must not be negative")
+	}
+	if cfg.CircuitMaxCooldown > 0 && cfg.CircuitCooldown > cfg.CircuitMaxCooldown {
+		return invalidArg("circuit_cooldown must not exceed circuit_max_cooldown")
+	}
+	if cfg.HealthRecoveryFloorPercent < 0 || cfg.HealthRecoveryFloorPercent > 100 {
+		return invalidArg("health_recovery_floor_percent: must be between 0 and 100")
 	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")

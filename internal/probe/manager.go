@@ -505,6 +505,17 @@ func (m *ProbeManager) scanLatency() {
 			return true // skip nil outbound
 		}
 
+		// A half-open node must bypass the interval gate. Its breaker cooldown
+		// has elapsed and it is waiting for a probe to decide whether it can
+		// rejoin routing; gating that probe behind MaxLatencyTestInterval (an
+		// hour by default) would make the cooldown unobservable and leave
+		// recovery to chance. Without this, a node isolated for 30s typically
+		// stays out for up to an hour.
+		if entry.IsHalfOpen() {
+			m.enqueueProbe(h, probeTaskKindLatency, probePriorityNormal)
+			return true
+		}
+
 		if !m.isLatencyProbeDue(entry, now, maxLatencyInterval, maxAuthorityInterval, authorities, lookahead) {
 			return true
 		}

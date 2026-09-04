@@ -14,6 +14,18 @@ import (
 )
 
 func newHealthTestPool(maxFailures int) (*GlobalNodePool, *SubscriptionManager) {
+	return newHealthTestPoolWithCooldown(maxFailures, 0, 0)
+}
+
+// newHealthTestPoolWithCooldown builds a pool whose breaker cooldown can be
+// controlled. A cooldown of 0 means "no cooldown", which keeps tests that
+// assert immediate recovery fast and deterministic; tests about the cooldown
+// itself pass explicit short durations.
+func newHealthTestPoolWithCooldown(
+	maxFailures int,
+	cooldown time.Duration,
+	maxCooldown time.Duration,
+) (*GlobalNodePool, *SubscriptionManager) {
 	subMgr := NewSubscriptionManager()
 	sub := subscription.NewSubscription("s1", "TestSub", "url", true, false)
 	subMgr.Register(sub)
@@ -23,6 +35,8 @@ func newHealthTestPool(maxFailures int) (*GlobalNodePool, *SubscriptionManager) 
 		GeoLookup:              func(addr netip.Addr) string { return "us" },
 		MaxLatencyTableEntries: 16,
 		MaxConsecutiveFailures: func() int { return maxFailures },
+		CircuitCooldown:        func() time.Duration { return cooldown },
+		CircuitMaxCooldown:     func() time.Duration { return maxCooldown },
 	})
 	return pool, subMgr
 }
@@ -158,6 +172,9 @@ func TestRecordResult_CircuitBreak_RemovesFromView(t *testing.T) {
 		GeoLookup:              func(addr netip.Addr) string { return "us" },
 		MaxLatencyTableEntries: 16,
 		MaxConsecutiveFailures: func() int { return 2 },
+		// No cooldown: this test asserts that the platform view follows the
+		// breaker state. Cooldown behaviour is covered separately.
+		CircuitCooldown: func() time.Duration { return 0 },
 	})
 	plat := platform.NewPlatform("p1", "Test", nil, nil)
 	pool.RegisterPlatform(plat)
@@ -587,5 +604,160 @@ func TestUpdateNodeEgressIP_LocStateMachine(t *testing.T) {
 	}
 	if got := entry.GetEgressIP(); got != ip2 {
 		t.Fatalf("egress IP should update on ip change: got %v, want %v", got, ip2)
+	}
+}
+
+// --- Circuit breaker cooldown ---
+
+// The whole point of the cooldown: a success arriving before it elapses must
+// not rejoin routing, otherwise a flapping node oscillates between removed and
+// routable many times a minute.
+func TestCircuitCooldown_SuccessBeforeCooldownDoesNotCloseBreaker(t *testing.T) {
+	pool, subMgr := newHealthTestPoolWithCooldown(2, time.Hour, 0)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"cooldown-open"}`)
+	entry, _ := pool.GetEntry(h)
+
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+	if !entry.IsCircuitOpen() {
+		t.Fatal("precondition: breaker should be open")
+	}
+	if entry.CircuitState(time.Now()) != node.CircuitOpen {
+		t.Fatal("precondition: breaker should still be inside cooldown")
+	}
+
+	scoreBeforeSuccess := entry.HealthScore()
+	pool.RecordResult(h, true)
+
+	// The cooldown has not elapsed, so the breaker must stay open.
+	if !entry.IsCircuitOpen() {
+		t.Fatal("breaker must not close before the cooldown elapses")
+	}
+	// The success is still recorded as health feedback, not thrown away.
+	if got := entry.HealthScore(); got <= scoreBeforeSuccess {
+		t.Fatalf("success should still feed the health score: before=%v after=%v",
+			scoreBeforeSuccess, got)
+	}
+}
+
+// Once the cooldown has elapsed a success closes the breaker, and the node is
+// lifted to a health floor above the filter threshold so it does not get
+// filtered straight back out on its stale score.
+func TestCircuitCooldown_SuccessAfterCooldownClosesBreaker(t *testing.T) {
+	const cooldown = 60 * time.Millisecond
+	pool, subMgr := newHealthTestPoolWithCooldown(2, cooldown, 0)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"cooldown-close"}`)
+	entry, _ := pool.GetEntry(h)
+
+	// Drive the score down so the recovery floor is observable.
+	for i := 0; i < 10; i++ {
+		pool.RecordResult(h, false)
+	}
+	time.Sleep(cooldown * 2)
+
+	if entry.CircuitState(time.Now()) != node.CircuitHalfOpen {
+		t.Fatalf("state: got %v, want half-open after the cooldown", entry.CircuitState(time.Now()))
+	}
+
+	pool.RecordResult(h, true)
+
+	if entry.IsCircuitOpen() {
+		t.Fatal("breaker should close once the cooldown has elapsed")
+	}
+	// Recovery floor is 60% by default; the closing success counts as one more
+	// healthy observation on top of it, so the score sits just above the floor.
+	if got := entry.HealthScore(); got < 0.6 || got >= 1 {
+		t.Fatalf("health after recovery: got %v, want >= 0.6 and < 1", got)
+	}
+	if got := entry.CircuitReopenCount.Load(); got != 0 {
+		t.Fatalf("reopen count after closing: got %d, want 0", got)
+	}
+}
+
+// Each failed half-open probe doubles the cooldown, measured from the original
+// isolation time rather than the last failure.
+func TestCircuitCooldown_HalfOpenFailureBacksOffExponentially(t *testing.T) {
+	const cooldown = 50 * time.Millisecond
+	pool, subMgr := newHealthTestPoolWithCooldown(2, cooldown, time.Hour)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"backoff"}`)
+	entry, _ := pool.GetEntry(h)
+
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+	openedAt := entry.CircuitOpenSince.Load()
+	if got := time.Duration(entry.CircuitCooldownNs.Load()); got != cooldown {
+		t.Fatalf("initial cooldown: got %v, want %v", got, cooldown)
+	}
+
+	// Fail one half-open probe: 50ms -> 100ms.
+	time.Sleep(cooldown * 2)
+	pool.RecordResult(h, false)
+	if got := time.Duration(entry.CircuitCooldownNs.Load()); got != 2*cooldown {
+		t.Fatalf("cooldown after 1st half-open failure: got %v, want %v", got, 2*cooldown)
+	}
+	if entry.CircuitOpenSince.Load() != openedAt {
+		t.Fatal("open timestamp must stay at the original isolation time")
+	}
+
+	// And again: 100ms -> 200ms.
+	time.Sleep(2 * cooldown * 2)
+	pool.RecordResult(h, false)
+	if got := time.Duration(entry.CircuitCooldownNs.Load()); got != 4*cooldown {
+		t.Fatalf("cooldown after 2nd half-open failure: got %v, want %v", got, 4*cooldown)
+	}
+	if got := entry.CircuitReopenCount.Load(); got != 2 {
+		t.Fatalf("reopen count: got %d, want 2", got)
+	}
+}
+
+// The backoff must stop growing at the configured maximum.
+func TestCircuitCooldown_BackoffIsCapped(t *testing.T) {
+	const (
+		cooldown = 20 * time.Millisecond
+		max      = 60 * time.Millisecond
+	)
+	pool, subMgr := newHealthTestPoolWithCooldown(2, cooldown, max)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"backoff-cap"}`)
+	entry, _ := pool.GetEntry(h)
+
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+
+	for i := 0; i < 4; i++ {
+		time.Sleep(max * 2)
+		pool.RecordResult(h, false)
+		if got := time.Duration(entry.CircuitCooldownNs.Load()); got > max {
+			t.Fatalf("iteration %d: cooldown %v exceeds the max %v", i, got, max)
+		}
+	}
+	if got := time.Duration(entry.CircuitCooldownNs.Load()); got != max {
+		t.Fatalf("cooldown should be pinned at the max: got %v, want %v", got, max)
+	}
+}
+
+// A disabled cooldown must stay disabled and never back off into a positive
+// value, no matter how many half-open probes fail.
+func TestCircuitCooldown_ZeroCooldownNeverBacksOff(t *testing.T) {
+	pool, subMgr := newHealthTestPoolWithCooldown(2, 0, 0)
+	sub := subMgr.Lookup("s1")
+	h := addTestNode(pool, sub, `{"type":"ss","n":"no-cooldown"}`)
+	entry, _ := pool.GetEntry(h)
+
+	pool.RecordResult(h, false)
+	pool.RecordResult(h, false)
+	for i := 0; i < 3; i++ {
+		pool.RecordResult(h, false)
+		if got := entry.CircuitCooldownNs.Load(); got != 0 {
+			t.Fatalf("iteration %d: cooldown should stay 0, got %v", i, got)
+		}
+	}
+
+	pool.RecordResult(h, true)
+	if entry.IsCircuitOpen() {
+		t.Fatal("with no cooldown a success must close the breaker")
 	}
 }
