@@ -161,8 +161,9 @@ func (p *OutboundTransportPool) newReusableOutboundTransport(ob adapter.Outbound
 	}
 }
 
-// dialOutbound dials through the node outbound with a bounded timeout and
-// enables TCP keep-alive on the resulting connection.
+// dialOutbound dials through the node outbound with a bounded timeout.
+//
+// It does not set TCP keep-alive: see the note inside for why.
 //
 // The timeout must bound the dial only. context.WithTimeout cannot be used
 // here: its timer fires unconditionally at the deadline, and outbound
