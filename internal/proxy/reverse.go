@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptrace"
@@ -8,9 +9,11 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
@@ -414,6 +417,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var transport *http.Transport
 	var nodeHashRaw = route.NodeHash
 	domain := netutil.ExtractDomain(parsed.Host)
+	// A response with a body is only counted as served once the body has been
+	// transferred in full. Set when the body is wrapped, so the success can be
+	// recorded after ServeHTTP returns instead of when headers arrive.
+	var transferResultPending atomic.Bool
+	var transferFailed atomic.Bool
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
 	} else {
@@ -505,20 +513,40 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					body = respBodyCapture
 					lifecycle.setRespBodyCapture(respBodyCapture)
 				}
-				ingressBodyCounter = newCountingReadCloser(body)
+				ingressBodyCounter = newCountingReadCloserWithErrHook(body, func(err error) {
+					// The body failed partway through. This must be recorded
+					// here rather than after ServeHTTP: ReverseProxy reports a
+					// copy failure by panicking with http.ErrAbortHandler,
+					// which skips everything after that call.
+					//
+					// A client that went away is not the node's fault — the
+					// forward path treats it the same way.
+					if r.Context().Err() == context.Canceled {
+						return
+					}
+					transferFailed.Store(true)
+					lifecycle.setNetOK(false)
+					lifecycle.setUpstreamError("reverse_upstream_to_client_copy", err)
+					if hasRoute {
+						// Transfer phase: the node was reached and had started
+						// responding, so this weighs less against it than a
+						// failure to reach it at all.
+						recordPassiveStageResultAsync(p.health, route, node.PassiveStageTransfer, false)
+					}
+				})
 				resp.Body = ingressBodyCounter
+				// Success is recorded once the body has been transferred.
+				transferResultPending.Store(true)
 			} else if detailCfg.Enabled {
 				respHeaders, respHeadersLen, respHeadersTruncated := captureHeadersWithLimit(resp.Header, detailCfg.RespHeadersMaxBytes)
 				lifecycle.setRespHeadersCaptured(respHeaders, respHeadersLen, respHeadersTruncated)
 			}
-			// Intentional coarse-grained policy:
-			// mark node success once upstream response headers arrive.
-			// Further attribution for mid-body stream failures is expensive and noisy
-			// (client abort vs upstream reset vs network blip), and the added
-			// complexity is not worth it for the current phase.
-			lifecycle.setNetOK(true)
-			if hasRoute {
-				recordPassiveResultAsync(p.health, route, true)
+			if !transferResultPending.Load() {
+				// No body to transfer, so nothing can fail after this point.
+				lifecycle.setNetOK(true)
+				if hasRoute {
+					recordPassiveResultAsync(p.health, route, true)
+				}
 			}
 			return nil
 		},
@@ -537,6 +565,28 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if upgradedStreamCounter != nil {
 		lifecycle.addIngressBytes(upgradedStreamCounter.TotalRead())
 		lifecycle.addEgressBytes(upgradedStreamCounter.TotalWrite())
+	}
+
+	// The body reached the client in full. A mid-body failure would already have
+	// recorded the failure, and would have panicked past this point anyway.
+	//
+	// Boundary worth knowing: this only sees read-side failures. If the client
+	// goes away mid-stream, copier fails on the write side and the read hook
+	// never fires. Under a real server the resulting panic skips this block, so
+	// nothing is recorded — the same outcome as a client cancel, which is
+	// correct. Outside an http.Server (tests, embedded callers) ServeHTTP
+	// returns normally and this records a success the body never earned.
+	// Closing that gap would mean wrapping the ResponseWriter to observe write
+	// errors, which is not worth it for a path production cannot reach.
+	//
+	// Also note this settles only when the body ends, so a long-lived stream
+	// (SSE, long polling, a large download) contributes its success sample at
+	// the end of the stream rather than when it starts.
+	if transferResultPending.Load() && !transferFailed.Load() {
+		lifecycle.setNetOK(true)
+		if hasRoute {
+			recordPassiveResultAsync(p.health, route, true)
+		}
 	}
 }
 

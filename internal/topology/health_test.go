@@ -761,3 +761,57 @@ func TestCircuitCooldown_ZeroCooldownNeverBacksOff(t *testing.T) {
 		t.Fatal("with no cooldown a success must close the breaker")
 	}
 }
+
+// A transfer failure says less about the node than a connect failure: the node
+// was reached and had started responding. That must be reflected in the health
+// score, but NOT in the breaker — whether a node gets removed must not depend
+// on which phase failed.
+func TestRecordPassiveStageResult_TransferFailureWeighsLessThanConnect(t *testing.T) {
+	pool, subMgr := newHealthTestPoolWithCooldown(2, 0, 0)
+	sub := subMgr.Lookup("s1")
+
+	connectHash := addTestNode(pool, sub, `{"type":"ss","n":"connect-fail"}`)
+	transferHash := addTestNode(pool, sub, `{"type":"ss","n":"transfer-fail"}`)
+
+	// "plat" is not registered, so the passive breaker is enabled and both
+	// phases reach the breaker.
+	for i := 0; i < 6; i++ {
+		pool.RecordPassiveStageResult("plat", connectHash, node.PassiveStageConnect, false)
+		pool.RecordPassiveStageResult("plat", transferHash, node.PassiveStageTransfer, false)
+	}
+
+	connectEntry, _ := pool.GetEntry(connectHash)
+	transferEntry, _ := pool.GetEntry(transferHash)
+
+	if transferEntry.HealthScore() <= connectEntry.HealthScore() {
+		t.Fatalf("transfer failures must hurt the score less: connect=%v transfer=%v",
+			connectEntry.HealthScore(), transferEntry.HealthScore())
+	}
+	// Removal decisions ignore the phase: a failure is a failure.
+	if got, want := connectEntry.FailureCount.Load(), transferEntry.FailureCount.Load(); got != want {
+		t.Fatalf("breaker must treat both phases alike: connect=%d transfer=%d", got, want)
+	}
+}
+
+// Successes are full-weight in both phases, so a node is not rewarded less just
+// because its traffic happens to be streaming.
+func TestRecordPassiveStageResult_SuccessIsUnweighted(t *testing.T) {
+	pool, subMgr := newHealthTestPoolWithCooldown(2, 0, 0)
+	sub := subMgr.Lookup("s1")
+
+	connectHash := addTestNode(pool, sub, `{"type":"ss","n":"connect-ok"}`)
+	transferHash := addTestNode(pool, sub, `{"type":"ss","n":"transfer-ok"}`)
+
+	for i := 0; i < 6; i++ {
+		pool.RecordPassiveStageResult("plat", connectHash, node.PassiveStageConnect, true)
+		pool.RecordPassiveStageResult("plat", transferHash, node.PassiveStageTransfer, true)
+	}
+
+	connectEntry, _ := pool.GetEntry(connectHash)
+	transferEntry, _ := pool.GetEntry(transferHash)
+
+	if connectEntry.HealthScore() != transferEntry.HealthScore() {
+		t.Fatalf("successes must count the same in both phases: connect=%v transfer=%v",
+			connectEntry.HealthScore(), transferEntry.HealthScore())
+	}
+}

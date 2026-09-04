@@ -12,6 +12,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
@@ -407,7 +408,9 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setUpstreamError("forward_upstream_to_client_copy", copyErr)
 			lifecycle.setNetOK(false)
 			if hasRoute {
-				recordPassiveResultAsync(p.health, route, false)
+				// The response had already started arriving, so this is a weaker
+				// signal about the node than a failure to reach it at all.
+				recordPassiveStageResultAsync(p.health, route, node.PassiveStageTransfer, false)
 			}
 		}
 		return

@@ -283,6 +283,9 @@ func newTopologyRuntime(
 		HealthRecoveryFloorPercent: func() int {
 			return runtimeConfigSnapshot(runtimeCfg).HealthRecoveryFloorPercent
 		},
+		HealthTransferFailureWeightPercent: func() int {
+			return runtimeConfigSnapshot(runtimeCfg).HealthTransferFailureWeightPercent
+		},
 		LatencyDecayWindow: func() time.Duration {
 			return time.Duration(runtimeConfigSnapshot(runtimeCfg).LatencyDecayWindow)
 		},

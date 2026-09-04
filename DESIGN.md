@@ -443,8 +443,15 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
 * **连通性信号**：
     * **HTTP 正向代理**：普通请求使用 `http.Client.Do`；`CONNECT` 隧道使用 `TcpDial` 与后续 tunnel copy 的结果。
     * **SOCKS5 正向代理**：使用 `TcpDial` 与后续 tunnel copy 的结果。
-    * **反向代理**：`httputil.ReverseProxy` 的 `ErrorHandler` 回调。
-    * 只要网络层建立连接成功（即便 HTTP 返回 500），通常视为节点健康（`RecordResult(true)`）；仅当网络握手失败、超时或连接被重置时，视为失败（`RecordResult(false)`）。
+    * **反向代理**：`httputil.ReverseProxy` 的 `ErrorHandler` 回调，以及响应 body 的读取结果（见下）。
+    * 只要网络层建立连接成功（即便 HTTP 返回 500），通常视为节点健康（`RecordResult(true)`）；仅当网络握手失败、超时或连接被重置时，视为失败（`RecordResult(false)`）。注意「HTTP 500 仍属连通成功」与下面的「body 传输完毕才算成功」是两件事：前者说**连通性**不看业务状态码，后者说**传输完整性**必须走完。
+    * **反向代理的成功判据是「响应 body 传输完毕」，而非「响应头到达」**。同时满足以下三种情形：
+        * 有 body 的响应：包一层带读取错误钩子的 body wrapper，在 `ServeHTTP` 返回后若未出现读取错误才记成功。无 body（或 101 升级）的响应在响应头到达时即结算——它们没有后续传输，不会中途失败。
+        * 之所以必须在读取出错的**当下**记录：标准库 `httputil.ReverseProxy` 在拷贝 body 失败时会 `panic(http.ErrAbortHandler)`，这会跳过 `ServeHTTP` 调用之后的**所有**语句，因此放到后面记录永远不会执行。
+        * 客户端主动取消（`r.Context().Err() == context.Canceled`）判为良性，不计失败，与正向代理一致。
+        * **后果一：长流在流结束时才结算。** SSE、长轮询、大文件下载等持续数分钟乃至数小时的连接，在结束前不产生任何成功样本。以长流为主的节点，其健康度会被短请求主导。这是「传输完毕才算成功」的必然代价，方向正确但需知晓。
+        * **后果二：只覆盖读取侧的失败。** 若客户端中途断开导致写入侧报错，读取钩子不会触发；真实服务器下随即 panic，结果与客户端取消等价（不记成功也不记失败），可接受。非 `http.Server` 调用方（含单元测试）下 `ServeHTTP` 正常返回，会记一次未 earned 的成功——生产不可达，故未额外包装 `ResponseWriter` 来捕获。
+        * **后果三：panic 路径下字节计数被跳过**，中断请求的 body 字节不进请求日志。`net_ok=false` 与 `upstream_error=reverse_upstream_to_client_copy` 已足够定位，故未改。
 * **延迟信号 (TLS Handshake)**：
     * 绝大多数业务流量为 HTTPS。Resin 的 HTTP 正向代理、SOCKS5 正向代理与反向代理均通过测量 **TLS Handshake RTT** 来评估节点延迟。
     * **隧道型正向代理（HTTP CONNECT / SOCKS5 CONNECT）**：包装目标连接，记录从写入 Client Hello (首字节) 到收到 Server Hello (由于 TCP 流式特性，通常是首个读操作) 的时间差。参考附录中的 `tlsLatencyConn` 实现。
@@ -454,6 +461,10 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
 #### 采样与反馈
 为避免阻塞数据链路，所有被动探测数据的记录均为**异步**执行。
 * **采样率**：100%。由于被动反馈极其廉价（仅为内存计数与原子操作），系统对所有业务流量进行采样。
+* **阶段区分（connect / transfer）**：
+    * `connect` 阶段：拨号与握手。失败意味着节点根本没被打通，是强信号。
+    * `transfer` 阶段：响应已开始返回之后。节点已被打通并开始响应，故障可能出在客户端或中间网络，因此是弱信号，按 `health_transfer_failure_weight_percent`（默认 50%）的权重计入健康度。
+    * **该区分只影响健康度，不影响熔断**：`FailureCount` 对两个阶段一视同仁，否则「是否摘除节点」会取决于故障发生在哪个阶段，而这是用户无法预期的。
 * **尝试时间戳更新规则**：
     * 被动流量**不更新**探测尝试时间戳（`LastLatencyProbeAttempt` / `LastAuthorityLatencyProbeAttempt`），走独立的 `RecordPassiveLatency` 通道。
     * 原因：`ProbeManager` 依据这两个时间戳判断节点是否到期需主动探测。若每个请求都刷新它们（历史行为），持续有流量的节点将永远「未到期」，主动探测被饿死，UI 上的延迟逐渐变为陈旧值，节点劣化也无法被主动发现。

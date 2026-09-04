@@ -87,6 +87,17 @@ func NewNodeEntry(hash Hash, rawOptions json.RawMessage, createdAt time.Time, ma
 	return e
 }
 
+// Phases of a proxied request, used when reporting passive health feedback.
+const (
+	// PassiveStageConnect covers dial and handshake: the node could not be
+	// reached, or would not complete a handshake.
+	PassiveStageConnect = "connect"
+	// PassiveStageTransfer covers everything after a response starts arriving.
+	// The node was reached, so a failure here says less about the node than a
+	// connect failure does.
+	PassiveStageTransfer = "transfer"
+)
+
 // --- Health score (success-ratio EWMA) ---
 
 const (

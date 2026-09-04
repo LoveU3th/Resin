@@ -49,6 +49,11 @@ type RuntimeConfig struct {
 	// its breaker closes. It sits above the filter threshold so the node
 	// re-enters routing instead of being filtered straight back out.
 	HealthRecoveryFloorPercent int `json:"health_recovery_floor_percent"`
+	// HealthTransferFailureWeightPercent scales how much a mid-body failure
+	// counts against the health score, as a percentage of a connect failure.
+	// The node was reached in that case, so the fault may not be its own.
+	// 100 weights both the same; 0 ignores transfer failures.
+	HealthTransferFailureWeightPercent int `json:"health_transfer_failure_weight_percent"`
 
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
@@ -75,18 +80,19 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		ReverseProxyLogRespHeadersMaxBytes: 1024,
 		ReverseProxyLogRespBodyMaxBytes:    1024,
 
-		MaxConsecutiveFailures:          3,
-		HealthEwmaWindow:                20,
-		HealthEwmaMinSamples:            5,
-		HealthPenaltyMs:                 2000,
-		HealthFilterThresholdPercent:    40,
-		HealthMinSamplesForFilter:       8,
-		CircuitCooldown:                 Duration(30 * time.Second),
-		CircuitMaxCooldown:              Duration(30 * time.Minute),
-		HealthRecoveryFloorPercent:      60,
-		MaxLatencyTestInterval:          Duration(1 * time.Hour),
-		MaxAuthorityLatencyTestInterval: Duration(3 * time.Hour),
-		MaxEgressTestInterval:           Duration(24 * time.Hour),
+		MaxConsecutiveFailures:             3,
+		HealthEwmaWindow:                   20,
+		HealthEwmaMinSamples:               5,
+		HealthPenaltyMs:                    2000,
+		HealthFilterThresholdPercent:       40,
+		HealthMinSamplesForFilter:          8,
+		CircuitCooldown:                    Duration(30 * time.Second),
+		CircuitMaxCooldown:                 Duration(30 * time.Minute),
+		HealthRecoveryFloorPercent:         60,
+		HealthTransferFailureWeightPercent: 50,
+		MaxLatencyTestInterval:             Duration(1 * time.Hour),
+		MaxAuthorityLatencyTestInterval:    Duration(3 * time.Hour),
+		MaxEgressTestInterval:              Duration(24 * time.Hour),
 
 		LatencyTestURL:     "https://www.gstatic.com/generate_204",
 		LatencyAuthorities: []string{"gstatic.com", "google.com", "cloudflare.com", "github.com"},

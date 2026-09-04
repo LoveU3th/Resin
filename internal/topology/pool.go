@@ -46,15 +46,16 @@ type GlobalNodePool struct {
 	onNodeLatencyChanged func(hash node.Hash, domain string) // fired on latency upserts and evictions
 
 	// Health config
-	maxLatencyTableEntries int
-	maxConsecutiveFailures func() int
-	latencyDecayWindow     func() time.Duration
-	latencyAuthorities     func() []string
-	healthEwmaWindow       func() int
-	healthEwmaMinSamples   func() int
-	circuitCooldown        func() time.Duration
-	circuitMaxCooldown     func() time.Duration
-	healthRecoveryFloorPct func() int
+	maxLatencyTableEntries         int
+	maxConsecutiveFailures         func() int
+	latencyDecayWindow             func() time.Duration
+	latencyAuthorities             func() []string
+	healthEwmaWindow               func() int
+	healthEwmaMinSamples           func() int
+	circuitCooldown                func() time.Duration
+	circuitMaxCooldown             func() time.Duration
+	healthRecoveryFloorPct         func() int
+	healthTransferFailureWeightPct func() int
 }
 
 // PoolConfig configures the GlobalNodePool.
@@ -80,10 +81,15 @@ type PoolConfig struct {
 	// backoff applied on repeated half-open failures. Both optional.
 	CircuitCooldown    func() time.Duration
 	CircuitMaxCooldown func() time.Duration
-	// HealthRecoveryFloor is the health score a node is lifted to when its
-	// breaker closes, as a percentage. It sits above the filter threshold so
+	// HealthRecoveryFloorPercent is the health score a node is lifted to when
+	// its breaker closes, as a percentage. It sits above the filter threshold so
 	// the node re-enters routing instead of being filtered out immediately.
 	HealthRecoveryFloorPercent func() int
+	// HealthTransferFailureWeightPercent scales how much a transfer-phase
+	// failure counts against the health score, as a percentage of a
+	// connect-phase failure. 100 weights them the same; 0 ignores transfer
+	// failures entirely.
+	HealthTransferFailureWeightPercent func() int
 }
 
 var (
@@ -101,25 +107,26 @@ func NewGlobalNodePool(cfg PoolConfig) *GlobalNodePool {
 	}
 
 	return &GlobalNodePool{
-		nodes:                  xsync.NewMap[node.Hash, *node.NodeEntry](),
-		subLookup:              cfg.SubLookup,
-		geoLookup:              cfg.GeoLookup,
-		onNodeAdded:            cfg.OnNodeAdded,
-		onNodeRemoved:          cfg.OnNodeRemoved,
-		onSubNodeChanged:       cfg.OnSubNodeChanged,
-		onNodeDynamicChanged:   cfg.OnNodeDynamicChanged,
-		onNodeLatencyChanged:   cfg.OnNodeLatencyChanged,
-		maxLatencyTableEntries: cfg.MaxLatencyTableEntries,
-		maxConsecutiveFailures: maxConsecutiveFailuresFn,
-		latencyDecayWindow:     cfg.LatencyDecayWindow,
-		latencyAuthorities:     cfg.LatencyAuthorities,
-		healthEwmaWindow:       cfg.HealthEwmaWindow,
-		healthEwmaMinSamples:   cfg.HealthEwmaMinSamples,
-		circuitCooldown:        cfg.CircuitCooldown,
-		circuitMaxCooldown:     cfg.CircuitMaxCooldown,
-		healthRecoveryFloorPct: cfg.HealthRecoveryFloorPercent,
-		platformByID:           make(map[string]*platform.Platform),
-		platformByName:         make(map[string]*platform.Platform),
+		nodes:                          xsync.NewMap[node.Hash, *node.NodeEntry](),
+		subLookup:                      cfg.SubLookup,
+		geoLookup:                      cfg.GeoLookup,
+		onNodeAdded:                    cfg.OnNodeAdded,
+		onNodeRemoved:                  cfg.OnNodeRemoved,
+		onSubNodeChanged:               cfg.OnSubNodeChanged,
+		onNodeDynamicChanged:           cfg.OnNodeDynamicChanged,
+		onNodeLatencyChanged:           cfg.OnNodeLatencyChanged,
+		maxLatencyTableEntries:         cfg.MaxLatencyTableEntries,
+		maxConsecutiveFailures:         maxConsecutiveFailuresFn,
+		latencyDecayWindow:             cfg.LatencyDecayWindow,
+		latencyAuthorities:             cfg.LatencyAuthorities,
+		healthEwmaWindow:               cfg.HealthEwmaWindow,
+		healthEwmaMinSamples:           cfg.HealthEwmaMinSamples,
+		circuitCooldown:                cfg.CircuitCooldown,
+		circuitMaxCooldown:             cfg.CircuitMaxCooldown,
+		healthRecoveryFloorPct:         cfg.HealthRecoveryFloorPercent,
+		healthTransferFailureWeightPct: cfg.HealthTransferFailureWeightPercent,
+		platformByID:                   make(map[string]*platform.Platform),
+		platformByName:                 make(map[string]*platform.Platform),
 	}
 }
 
@@ -561,8 +568,22 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 		return
 	}
 
-	dynamicChanged := false
-	circuitStateChanged := false
+	dynamicChanged, circuitStateChanged := p.recordBreaker(entry, success)
+	// A probe result is an unambiguous signal, so it counts in full.
+	p.recordHealth(entry, success, 1)
+
+	if circuitStateChanged {
+		p.notifyAllPlatformsDirty(hash)
+	}
+	if dynamicChanged && p.onNodeDynamicChanged != nil {
+		p.onNodeDynamicChanged(hash)
+	}
+}
+
+// recordBreaker applies one result to the breaker only, leaving the health
+// score alone. Returns whether dynamic fields changed and whether the breaker
+// opened or closed.
+func (p *GlobalNodePool) recordBreaker(entry *node.NodeEntry, success bool) (dynamicChanged, circuitStateChanged bool) {
 	now := time.Now()
 
 	if success {
@@ -621,17 +642,52 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 		}
 	}
 
-	// Health score is folded in alongside the breaker bookkeeping, but is not
-	// derived from it: the breaker only sees consecutive failures, which says
-	// nothing about a node that fails intermittently and never trips it.
-	entry.RecordHealthSample(success, 1, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
+	return dynamicChanged, circuitStateChanged
+}
 
-	if circuitStateChanged {
-		p.notifyAllPlatformsDirty(hash)
+// recordHealth folds one observation into the score with the given weight.
+// It is deliberately separate from the breaker: the breaker takes the raw
+// result, while health needs to weigh a weak signal less than a strong one.
+func (p *GlobalNodePool) recordHealth(entry *node.NodeEntry, success bool, weight float64) {
+	entry.RecordHealthSample(success, weight, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
+}
+
+// RecordPassiveStageResult records traffic feedback for one phase of a request.
+//
+// The breaker always sees the raw result — a failure is a failure regardless of
+// phase. The health score does not: a connect failure means the node could not
+// be reached at all, while a transfer failure means it was reached and had
+// already started responding, so the fault may lie with the client or the
+// network in between. Transfer failures are therefore weighted lower.
+func (p *GlobalNodePool) RecordPassiveStageResult(
+	platformID string,
+	hash node.Hash,
+	stage string,
+	success bool,
+) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
 	}
-	if dynamicChanged && p.onNodeDynamicChanged != nil {
-		p.onNodeDynamicChanged(hash)
+
+	weight := 1.0
+	if !success && stage == node.PassiveStageTransfer {
+		weight = p.currentTransferFailureWeight()
 	}
+
+	// The breaker is skipped entirely for platforms that opted out, matching
+	// RecordPassiveResult.
+	if success || !p.passiveCircuitBreakerDisabled(platformID) {
+		dynamicChanged, circuitStateChanged := p.recordBreaker(entry, success)
+		if circuitStateChanged {
+			p.notifyAllPlatformsDirty(hash)
+		}
+		if dynamicChanged && p.onNodeDynamicChanged != nil {
+			p.onNodeDynamicChanged(hash)
+		}
+	}
+
+	p.recordHealth(entry, success, weight)
 }
 
 // RecordPassiveResult records health feedback from user proxy traffic.
@@ -643,19 +699,7 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 // a platform would only ever see probe results — and probes are exactly what
 // reports "reachable" for a node that breaks on real traffic.
 func (p *GlobalNodePool) RecordPassiveResult(platformID string, hash node.Hash, success bool) {
-	if success || !p.passiveCircuitBreakerDisabled(platformID) {
-		// RecordResult folds this into the health score too.
-		p.RecordResult(hash, success)
-		return
-	}
-
-	// Failure on a platform that opted out: keep it away from the breaker, but
-	// let the health score see it.
-	entry, ok := p.nodes.Load(hash)
-	if !ok {
-		return
-	}
-	entry.RecordHealthSample(false, 1, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
+	p.RecordPassiveStageResult(platformID, hash, node.PassiveStageConnect, success)
 }
 
 func (p *GlobalNodePool) passiveCircuitBreakerDisabled(platformID string) bool {
@@ -700,6 +744,10 @@ const (
 	// defaultHealthRecoveryFloorPercent sits above the default filter
 	// threshold (40) so a recovered node is not immediately filtered out.
 	defaultHealthRecoveryFloorPercent = 60
+	// defaultHealthTransferFailureWeightPercent: a transfer failure means the
+	// node was reached and had begun responding, so it is counted at half the
+	// weight of a connect failure.
+	defaultHealthTransferFailureWeightPercent = 50
 	// backoffShiftLimit caps the 2^n growth well below the int64 range.
 	backoffShiftLimit = 40
 )
@@ -724,6 +772,22 @@ func (p *GlobalNodePool) currentCircuitMaxCooldown() time.Duration {
 		return d
 	}
 	return defaultCircuitMaxCooldown
+}
+
+// currentTransferFailureWeight returns how much a transfer-phase failure counts
+// against the health score, relative to a connect-phase failure.
+func (p *GlobalNodePool) currentTransferFailureWeight() float64 {
+	pct := defaultHealthTransferFailureWeightPercent
+	if p.healthTransferFailureWeightPct != nil {
+		pct = p.healthTransferFailureWeightPct()
+	}
+	if pct < 0 {
+		return 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return float64(pct) / 100
 }
 
 func (p *GlobalNodePool) currentHealthRecoveryFloor() float64 {

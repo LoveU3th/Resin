@@ -92,6 +92,7 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"circuit_cooldown":                         true,
 	"circuit_max_cooldown":                     true,
 	"health_recovery_floor_percent":            true,
+	"health_transfer_failure_weight_percent":   true,
 	"max_latency_test_interval":                true,
 	"max_authority_latency_test_interval":      true,
 	"max_egress_test_interval":                 true,
@@ -244,6 +245,9 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.HealthRecoveryFloorPercent < 0 || cfg.HealthRecoveryFloorPercent > 100 {
 		return invalidArg("health_recovery_floor_percent: must be between 0 and 100")
+	}
+	if cfg.HealthTransferFailureWeightPercent < 0 || cfg.HealthTransferFailureWeightPercent > 100 {
+		return invalidArg("health_transfer_failure_weight_percent: must be between 0 and 100")
 	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")

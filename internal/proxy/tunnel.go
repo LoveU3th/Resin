@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/routing"
 	M "github.com/sagernet/sing/common/metadata"
@@ -107,9 +108,11 @@ func prepareConnectTunnel(
 		}
 	}
 
+	// The tunnel is established at this point, so outcomes from here on describe
+	// data transfer rather than reachability.
 	recordResult := func(ok bool) {
 		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, ok)
+			recordPassiveStageResultAsync(deps.health, routed.Route, node.PassiveStageTransfer, ok)
 		}
 	}
 

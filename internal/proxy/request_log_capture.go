@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync/atomic"
 )
 
 // captureRequestHeaders serializes headers to canonical wire format for
@@ -93,16 +94,36 @@ func (c *payloadCaptureReadCloser) Truncated() bool {
 type countingReadCloser struct {
 	rc    io.ReadCloser
 	total int64
+	// onReadErr, when set, is called once with the first non-EOF read error.
+	//
+	// A mid-body failure cannot be recorded after the fact: httputil.ReverseProxy
+	// reports it by panicking with http.ErrAbortHandler, which skips every
+	// statement following its ServeHTTP call. The failure therefore has to be
+	// captured at the moment the read fails.
+	onReadErr func(error)
+	notified  atomic.Bool
 }
 
 func newCountingReadCloser(rc io.ReadCloser) *countingReadCloser {
 	return &countingReadCloser{rc: rc}
 }
 
+// newCountingReadCloserWithErrHook counts bytes and reports the first read
+// error through onReadErr. io.EOF is a normal end of body, not an error.
+func newCountingReadCloserWithErrHook(
+	rc io.ReadCloser,
+	onReadErr func(error),
+) *countingReadCloser {
+	return &countingReadCloser{rc: rc, onReadErr: onReadErr}
+}
+
 func (c *countingReadCloser) Read(p []byte) (int, error) {
 	n, err := c.rc.Read(p)
 	if n > 0 {
 		c.total += int64(n)
+	}
+	if err != nil && err != io.EOF && c.onReadErr != nil && c.notified.CompareAndSwap(false, true) {
+		c.onReadErr(err)
 	}
 	return n, err
 }
