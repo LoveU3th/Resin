@@ -597,6 +597,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		route = failoverRT.result.Route
 		hasRoute = true
 		lifecycle.setRouteResult(route)
+		lifecycle.recordFailover(failoverRT.result.Attempts, failoverRT.result.FailedNodes)
 	}
 
 	if upstreamTrace.shouldCommitEgress() {

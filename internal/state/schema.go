@@ -43,7 +43,9 @@ func InitDB(db *sql.DB, ddl string) error {
 	return err
 }
 
-func ensureTableColumn(db *sql.DB, table, column, columnDDL string) error {
+// EnsureTableColumn adds a column when missing, leaving existing rows intact.
+// Needed because deployed databases predate columns added in later releases.
+func EnsureTableColumn(db *sql.DB, table, column, columnDDL string) error {
 	exists, err := hasTableColumn(db, table, column)
 	if err != nil {
 		return err

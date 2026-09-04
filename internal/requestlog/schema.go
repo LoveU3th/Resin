@@ -43,7 +43,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
 	req_headers_truncated  INTEGER NOT NULL DEFAULT 0,
 	req_body_truncated     INTEGER NOT NULL DEFAULT 0,
 	resp_headers_truncated INTEGER NOT NULL DEFAULT 0,
-	resp_body_truncated    INTEGER NOT NULL DEFAULT 0
+	resp_body_truncated    INTEGER NOT NULL DEFAULT 0,
+	failover_attempts      INTEGER NOT NULL DEFAULT 0,
+	failover_nodes         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS request_log_payloads (
@@ -65,7 +67,13 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_egress_ip    ON request_logs(egress_
 
 func ensureRequestLogSchema(db *sql.DB) error {
 	// 请求日志是滚动持久化数据，新增列需要兼容已经存在的历史 DB 文件。
-	return ensureRequestLogColumn(db, "request_logs", "first_byte_duration_ns", "first_byte_duration_ns INTEGER NOT NULL DEFAULT 0")
+	if err := ensureRequestLogColumn(db, "request_logs", "first_byte_duration_ns", "first_byte_duration_ns INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureRequestLogColumn(db, "request_logs", "failover_attempts", "failover_attempts INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return ensureRequestLogColumn(db, "request_logs", "failover_nodes", "failover_nodes TEXT NOT NULL DEFAULT ''")
 }
 
 func ensureRequestLogColumn(db *sql.DB, table, column, columnDDL string) error {

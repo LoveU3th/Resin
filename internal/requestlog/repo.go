@@ -18,7 +18,7 @@ import (
 	"github.com/Resinat/Resin/internal/state"
 )
 
-const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, platform_name, account, target_host, target_url, node_hash, node_tag, egress_ip, duration_ns, first_byte_duration_ns, net_ok, http_method, http_status, resin_error, upstream_stage, upstream_err_kind, upstream_errno, upstream_err_msg, ingress_bytes, egress_bytes, payload_present, req_headers_len, req_body_len, resp_headers_len, resp_body_len, req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated"
+const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, platform_name, account, target_host, target_url, node_hash, node_tag, egress_ip, duration_ns, first_byte_duration_ns, net_ok, http_method, http_status, resin_error, upstream_stage, upstream_err_kind, upstream_errno, upstream_err_msg, ingress_bytes, egress_bytes, payload_present, req_headers_len, req_body_len, resp_headers_len, resp_body_len, req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated, failover_attempts, failover_nodes"
 
 // Repo manages rolling SQLite databases for request logs.
 // Each DB is named request_logs-<unix_ms>.db and lives in logDir.
@@ -134,8 +134,9 @@ func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
 		ingress_bytes, egress_bytes,
 		payload_present,
 		req_headers_len, req_body_len, resp_headers_len, resp_body_len,
-		req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated,
+		failover_attempts, failover_nodes
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return 0, fmt.Errorf("requestlog repo prepare log: %w", err)
 	}
@@ -176,6 +177,7 @@ func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
 			e.ReqHeadersLen, e.ReqBodyLen, e.RespHeadersLen, e.RespBodyLen,
 			boolToInt(e.ReqHeadersTruncated), boolToInt(e.ReqBodyTruncated),
 			boolToInt(e.RespHeadersTruncated), boolToInt(e.RespBodyTruncated),
+			e.FailoverAttempts, e.FailoverNodes,
 		)
 		if err != nil {
 			log.Printf("[requestlog] warning: skip log row id=%q insert failed: %v", id, err)
@@ -240,15 +242,17 @@ type LogSummary struct {
 	IngressBytes        int64  `json:"ingress_bytes"`
 	EgressBytes         int64  `json:"egress_bytes"`
 
-	PayloadPresent       bool `json:"payload_present"`
-	ReqHeadersLen        int  `json:"req_headers_len"`
-	ReqBodyLen           int  `json:"req_body_len"`
-	RespHeadersLen       int  `json:"resp_headers_len"`
-	RespBodyLen          int  `json:"resp_body_len"`
-	ReqHeadersTruncated  bool `json:"req_headers_truncated"`
-	ReqBodyTruncated     bool `json:"req_body_truncated"`
-	RespHeadersTruncated bool `json:"resp_headers_truncated"`
-	RespBodyTruncated    bool `json:"resp_body_truncated"`
+	PayloadPresent       bool   `json:"payload_present"`
+	ReqHeadersLen        int    `json:"req_headers_len"`
+	ReqBodyLen           int    `json:"req_body_len"`
+	RespHeadersLen       int    `json:"resp_headers_len"`
+	RespBodyLen          int    `json:"resp_body_len"`
+	ReqHeadersTruncated  bool   `json:"req_headers_truncated"`
+	ReqBodyTruncated     bool   `json:"req_body_truncated"`
+	RespHeadersTruncated bool   `json:"resp_headers_truncated"`
+	RespBodyTruncated    bool   `json:"resp_body_truncated"`
+	FailoverAttempts     int    `json:"failover_attempts"`
+	FailoverNodes        string `json:"failover_nodes"`
 }
 
 // PayloadRow holds the payload data for a single log entry.
@@ -774,6 +778,7 @@ func scanLogSummary(s rowScanner) (LogSummary, error) {
 		&payloadPresent,
 		&row.ReqHeadersLen, &row.ReqBodyLen, &row.RespHeadersLen, &row.RespBodyLen,
 		&rht, &rbt, &rsht, &rsbt,
+		&row.FailoverAttempts, &row.FailoverNodes,
 	)
 	if err != nil {
 		return LogSummary{}, err

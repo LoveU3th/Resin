@@ -288,13 +288,22 @@ func HandleHistoryRequests(mgr *metrics.Manager) http.Handler {
 			if row.TotalRequests > 0 {
 				rate = float64(row.SuccessRequests) / float64(row.TotalRequests)
 			}
+			// node_requests is the denominator, not total_requests: bypassed
+			// traffic never touches a node, so it says nothing about reliability.
+			var firstHopRate float64
+			if row.NodeRequests > 0 {
+				firstHopRate = float64(row.FirstHopSuccess) / float64(row.NodeRequests)
+			}
 			bucketStart, bucketEnd := bucketWindow(row.BucketStartUnix, bucketSeconds)
 			return map[string]any{
-				"bucket_start":     bucketStart,
-				"bucket_end":       bucketEnd,
-				"total_requests":   row.TotalRequests,
-				"success_requests": row.SuccessRequests,
-				"success_rate":     rate,
+				"bucket_start":           bucketStart,
+				"bucket_end":             bucketEnd,
+				"total_requests":         row.TotalRequests,
+				"success_requests":       row.SuccessRequests,
+				"success_rate":           rate,
+				"node_requests":          row.NodeRequests,
+				"first_hop_success":      row.FirstHopSuccess,
+				"first_hop_success_rate": firstHopRate,
 			}
 		})
 		WriteJSON(w, http.StatusOK, map[string]any{

@@ -398,3 +398,48 @@ func TestErrAbandonedReportsAsTimeout(t *testing.T) {
 		t.Fatal("errors.Is must keep working for the value-typed sentinel")
 	}
 }
+
+// The node list is deliberately capped: a pathological retry chain must not
+// blow up a log row.
+func TestFormatFailoverNodes_CapsEntries(t *testing.T) {
+	var nodes []node.Hash
+	for i := 0; i < 8; i++ {
+		nodes = append(nodes, node.Hash{byte(i + 1)})
+	}
+
+	got := formatFailoverNodes(nodes)
+	if want := maxFailoverNodesLogged; strings.Count(got, ",") != want-1 {
+		t.Fatalf("expected %d entries, got %q", want, got)
+
+	}
+	if len(got) > 3*16+2 {
+		t.Fatalf("node list too long: %q", got)
+	}
+}
+
+func TestFormatFailoverNodes_Empty(t *testing.T) {
+	if got := formatFailoverNodes(nil); got != "" {
+		t.Fatalf("got %q, want empty", got)
+	}
+}
+
+// A retry means the first node did not serve it, whatever the final outcome.
+// That is the signal the first-hop metric is built on.
+func TestRecordFailover_ClearsFirstHopOK(t *testing.T) {
+	l := newRequestLifecycle(NoOpEventEmitter{}, nil, ProxyTypeForward, false)
+	if !l.finished.FirstHopOK {
+		t.Fatal("an ordinary request should start out first-hop successful")
+	}
+
+	l.recordFailover(2, []node.Hash{{1}})
+
+	if l.finished.FirstHopOK {
+		t.Fatal("a retried request must not count as first-hop successful")
+	}
+	if l.log.FailoverAttempts != 2 {
+		t.Fatalf("attempts: got %d, want 2", l.log.FailoverAttempts)
+	}
+	if l.log.FailoverNodes == "" {
+		t.Fatal("expected the failed node to be recorded")
+	}
+}

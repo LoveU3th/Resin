@@ -42,9 +42,9 @@ type EnvConfig struct {
 	ProbeTimeout                                    time.Duration
 	ResourceFetchTimeout                            time.Duration
 	NodeDNSUpstreams                                []string
-	ProxyTransportMaxIdleConns        int
-	ProxyTransportMaxIdleConnsPerHost int
-	ProxyTransportIdleConnTimeout     time.Duration
+	ProxyTransportMaxIdleConns                      int
+	ProxyTransportMaxIdleConnsPerHost               int
+	ProxyTransportIdleConnTimeout                   time.Duration
 	// ProxyTransportDialTimeout bounds one outbound dial.
 	ProxyTransportDialTimeout time.Duration
 	// ProxyTransportTLSHandshakeTimeout bounds the upstream TLS handshake.
@@ -57,7 +57,7 @@ type EnvConfig struct {
 	// sing-box and are not affected by this setting.
 	ProxyTransportKeepAlivePeriod time.Duration
 	ProxyBypassRules              []string
-	ForwardStickyAccount                            platform.ForwardStickyAccount
+	ForwardStickyAccount          platform.ForwardStickyAccount
 
 	// Request log
 	RequestLogQueueSize           int
@@ -72,8 +72,11 @@ type EnvConfig struct {
 	ProxyToken  string
 
 	// Metrics
-	MetricThroughputIntervalSeconds   int
-	MetricThroughputRetentionSeconds  int
+	MetricThroughputIntervalSeconds  int
+	MetricThroughputRetentionSeconds int
+	// MetricRetentionDays bounds how long persisted metric buckets are kept. 0
+	// keeps them forever, which is what metrics.db effectively did before.
+	MetricRetentionDays               int
 	MetricBucketSeconds               int
 	MetricConnectionsIntervalSeconds  int
 	MetricConnectionsRetentionSeconds int
@@ -188,6 +191,7 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	// --- Metrics ---
 	cfg.MetricThroughputIntervalSeconds = envInt("RESIN_METRIC_THROUGHPUT_INTERVAL_SECONDS", 2, &errs)
 	cfg.MetricThroughputRetentionSeconds = envInt("RESIN_METRIC_THROUGHPUT_RETENTION_SECONDS", 3600, &errs)
+	cfg.MetricRetentionDays = envInt("RESIN_METRIC_RETENTION_DAYS", 30, &errs)
 	cfg.MetricBucketSeconds = envInt("RESIN_METRIC_BUCKET_SECONDS", 3600, &errs)
 	cfg.MetricConnectionsIntervalSeconds = envInt("RESIN_METRIC_CONNECTIONS_INTERVAL_SECONDS", 15, &errs)
 	cfg.MetricConnectionsRetentionSeconds = envInt("RESIN_METRIC_CONNECTIONS_RETENTION_SECONDS", 18000, &errs)

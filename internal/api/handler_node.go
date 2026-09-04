@@ -42,6 +42,10 @@ func compareNodeSummaries(sortBy string, a, b service.NodeSummary) int {
 		order = cmp.Compare(a.FailureCount, b.FailureCount)
 	case "region":
 		order = strings.Compare(a.Region, b.Region)
+	case "success_rate":
+		// Nodes without enough observations sort last: treating "unmeasured" as
+		// a score would rank them as perfectly healthy.
+		order = compareOptionalFloat(a.SuccessRate, b.SuccessRate)
 	default:
 		order = strings.Compare(nodeTagSortKey(a), nodeTagSortKey(b))
 	}
@@ -152,7 +156,7 @@ func HandleListNodes(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 
-		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"tag", "created_at", "failure_count", "region"}, "tag", "asc")
+		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"tag", "created_at", "failure_count", "region", "success_rate"}, "tag", "asc")
 		if !ok {
 			return
 		}
@@ -209,5 +213,20 @@ func HandleProbeLatency(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 		WriteJSON(w, http.StatusOK, result)
+	}
+}
+
+// compareOptionalFloat orders optional values, putting nil last so that an
+// unknown value is never mistaken for a good one.
+func compareOptionalFloat(a, b *float64) int {
+	switch {
+	case a == nil && b == nil:
+		return 0
+	case a == nil:
+		return 1
+	case b == nil:
+		return -1
+	default:
+		return cmp.Compare(*a, *b)
 	}
 }

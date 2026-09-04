@@ -212,6 +212,20 @@ function getNodeDisplayStatus(node: NodeSummary): NodeDisplayStatus {
   return "healthy";
 }
 
+/** Colours a health score the same way latency is coloured, so a weak node stands out. */
+function successRateColor(rate: number): string {
+  if (!Number.isFinite(rate)) {
+    return "var(--text-secondary)";
+  }
+  if (rate >= 0.9) {
+    return "var(--success)";
+  }
+  if (rate >= 0.6) {
+    return "var(--warning)";
+  }
+  return "var(--danger)";
+}
+
 function referenceLatencyColor(latencyMs: number): string {
   if (!Number.isFinite(latencyMs)) {
     return "var(--text-secondary)";
@@ -593,6 +607,27 @@ export function NodesPage() {
       cell: (info) => {
         const node = info.row.original;
         return !node.has_outbound ? "-" : node.failure_count;
+      },
+    }),
+    col.display({
+      id: "success_rate",
+      header: () => (
+        <button type="button" className="table-sort-btn" onClick={() => changeSort("success_rate")}>
+          {t("成功率")}
+          <span>{sortIndicator(sortBy === "success_rate", sortOrder)}</span>
+        </button>
+      ),
+      cell: (info) => {
+        const node = info.row.original;
+        if (!node.has_outbound || node.success_rate === undefined) {
+          return "-";
+        }
+        const rate = node.success_rate;
+        return (
+          <span style={{ color: successRateColor(rate), fontWeight: 600 }}>
+            {`${Math.round(rate * 100)}%`}
+          </span>
+        );
       },
     }),
     col.display({

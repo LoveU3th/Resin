@@ -27,6 +27,11 @@ type trafficAccum struct {
 type requestAccum struct {
 	Total   int64
 	Success int64
+	// NodeTotal counts requests that went through a node, i.e. the denominator
+	// for FirstHop. Bypassed traffic is excluded.
+	NodeTotal int64
+	// FirstHop counts requests served by the first node tried.
+	FirstHop int64
 }
 
 type probeAccum struct {
@@ -106,16 +111,50 @@ func (b *BucketAggregator) SnapshotRequests(platformID string) (bucketStartUnix,
 	return b.currentStart, acc.Total, acc.Success
 }
 
-// AddRequestCounts records aggregated request counts into the current bucket.
-func (b *BucketAggregator) AddRequestCounts(platformID string, total, success int64) {
+// RequestCounts returns every request counter for a scope in one call.
+//
+// Reading them together matters: SnapshotRequests and a separate first-hop read
+// take the lock twice, and a concurrent flush could land between them, so total
+// and firstHop would come from different instants and could momentarily violate
+// firstHop <= nodeTotal.
+func (b *BucketAggregator) RequestCounts(platformID string) (bucketStartUnix, total, success, nodeTotal, firstHop int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	acc, exists := b.requests[platformID]
+	if !exists {
+		return b.currentStart, 0, 0, 0, 0
+	}
+	return b.currentStart, acc.Total, acc.Success, acc.NodeTotal, acc.FirstHop
+}
+
+// AddRequestCounts records aggregated request outcomes.
+//
+// firstHop counts requests served by the first node tried. It is the metric that
+// shows what failover hides: a node can fail every first attempt and still leave
+// the final success rate untouched, because another node picks up the request.
+func (b *BucketAggregator) AddRequestCounts(platformID string, total, success, nodeTotal, firstHop int64) {
 	if total <= 0 {
 		return
 	}
 	if success < 0 {
 		success = 0
 	}
+	if nodeTotal < 0 {
+		nodeTotal = 0
+	}
+	if firstHop < 0 {
+		firstHop = 0
+	}
 	if success > total {
 		success = total
+	}
+	if nodeTotal > total {
+		nodeTotal = total
+	}
+	// A first-hop success is also a node request, so it can never exceed it.
+	if firstHop > nodeTotal {
+		firstHop = nodeTotal
 	}
 
 	b.mu.Lock()
@@ -124,11 +163,15 @@ func (b *BucketAggregator) AddRequestCounts(platformID string, total, success in
 	g := b.getRequest("")
 	g.Total += total
 	g.Success += success
+	g.NodeTotal += nodeTotal
+	g.FirstHop += firstHop
 
 	if platformID != "" {
 		p := b.getRequest(platformID)
 		p.Total += total
 		p.Success += success
+		p.NodeTotal += nodeTotal
+		p.FirstHop += firstHop
 	}
 }
 

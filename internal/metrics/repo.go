@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS metric_request_bucket (
 	bucket_start_unix  INTEGER NOT NULL,
 	platform_id        TEXT,
 	total_requests     INTEGER NOT NULL DEFAULT 0,
-	success_requests   INTEGER NOT NULL DEFAULT 0
+	success_requests   INTEGER NOT NULL DEFAULT 0,
+	node_requests      INTEGER NOT NULL DEFAULT 0,
+	first_hop_success  INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_metric_request_bucket_dim
 	ON metric_request_bucket(bucket_start_unix, platform_id);
@@ -83,6 +85,17 @@ func NewMetricsRepo(path string) (*MetricsRepo, error) {
 		db.Close()
 		return nil, fmt.Errorf("metrics repo init: %w", err)
 	}
+	// Databases created before first-hop tracking was added lack these columns.
+	if err := state.EnsureTableColumn(db, "metric_request_bucket", "first_hop_success",
+		"first_hop_success INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("metrics repo migrate: %w", err)
+	}
+	if err := state.EnsureTableColumn(db, "metric_request_bucket", "node_requests",
+		"node_requests INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("metrics repo migrate: %w", err)
+	}
 	return &MetricsRepo{db: db}, nil
 }
 
@@ -120,10 +133,14 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 	if rq, ok := data.Requests[""]; ok {
 		globalRequests = rq
 	}
-	_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
-		VALUES (?,NULL,?,?) ON CONFLICT(bucket_start_unix) WHERE platform_id IS NULL
-		DO UPDATE SET total_requests = excluded.total_requests, success_requests = excluded.success_requests`,
-		data.BucketStartUnix, globalRequests.Total, globalRequests.Success)
+	_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests, node_requests, first_hop_success)
+		VALUES (?,NULL,?,?,?,?) ON CONFLICT(bucket_start_unix) WHERE platform_id IS NULL
+		DO UPDATE SET total_requests = excluded.total_requests,
+			success_requests = excluded.success_requests,
+			node_requests = excluded.node_requests,
+			first_hop_success = excluded.first_hop_success`,
+		data.BucketStartUnix, globalRequests.Total, globalRequests.Success,
+		globalRequests.NodeTotal, globalRequests.FirstHop)
 	if err != nil {
 		return fmt.Errorf("metrics repo upsert global request: %w", err)
 	}
@@ -132,10 +149,13 @@ func (r *MetricsRepo) WriteBucket(data *BucketFlushData) error {
 		if pid == "" {
 			continue
 		}
-		_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests)
-			VALUES (?,?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
-			DO UPDATE SET total_requests = excluded.total_requests, success_requests = excluded.success_requests`,
-			data.BucketStartUnix, pid, rq.Total, rq.Success)
+		_, err = tx.Exec(`INSERT INTO metric_request_bucket (bucket_start_unix, platform_id, total_requests, success_requests, node_requests, first_hop_success)
+			VALUES (?,?,?,?,?,?) ON CONFLICT(bucket_start_unix, platform_id)
+			DO UPDATE SET total_requests = excluded.total_requests,
+				success_requests = excluded.success_requests,
+				node_requests = excluded.node_requests,
+				first_hop_success = excluded.first_hop_success`,
+			data.BucketStartUnix, pid, rq.Total, rq.Success, rq.NodeTotal, rq.FirstHop)
 		if err != nil {
 			return fmt.Errorf("metrics repo upsert request: %w", err)
 		}
@@ -233,11 +253,15 @@ type RequestBucketRow struct {
 	PlatformID      string `json:"platform_id"`
 	TotalRequests   int64  `json:"total_requests"`
 	SuccessRequests int64  `json:"success_requests"`
+	// NodeRequests is how many of TotalRequests went through a node. It is the
+	// denominator for FirstHopSuccess, so the two must always be read together.
+	NodeRequests    int64 `json:"node_requests"`
+	FirstHopSuccess int64 `json:"first_hop_success"`
 }
 
 // QueryRequests returns request buckets in a time range.
 func (r *MetricsRepo) QueryRequests(from, to int64, platformID string) ([]RequestBucketRow, error) {
-	q := `SELECT bucket_start_unix, platform_id, total_requests, success_requests
+	q := `SELECT bucket_start_unix, platform_id, total_requests, success_requests, node_requests, first_hop_success
 		FROM metric_request_bucket WHERE bucket_start_unix >= ? AND bucket_start_unix <= ?`
 	args := []interface{}{from, to}
 	if platformID != "" {
@@ -258,7 +282,8 @@ func (r *MetricsRepo) QueryRequests(from, to int64, platformID string) ([]Reques
 	for rows.Next() {
 		var row RequestBucketRow
 		var pid sql.NullString
-		if err := rows.Scan(&row.BucketStartUnix, &pid, &row.TotalRequests, &row.SuccessRequests); err != nil {
+		if err := rows.Scan(&row.BucketStartUnix, &pid, &row.TotalRequests, &row.SuccessRequests,
+			&row.NodeRequests, &row.FirstHopSuccess); err != nil {
 			continue
 		}
 		if pid.Valid {
@@ -426,4 +451,40 @@ func (r *MetricsRepo) QueryLeaseLifetime(from, to int64, platformID string) ([]L
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+// PruneOlderThan deletes metric rows whose bucket starts before the cutoff.
+//
+// metrics.db previously had no cleanup at all: the retention settings only bound
+// the in-memory ring buffers, so every bucket written to disk stayed there
+// forever. Per-node series make that grow without bound, so it needs a real
+// cutoff. RetentionDays <= 0 means keep everything.
+func (r *MetricsRepo) PruneOlderThan(cutoffUnix int64) (int64, error) {
+	if r == nil || r.db == nil || cutoffUnix <= 0 {
+		return 0, nil
+	}
+
+	statements := []string{
+		`DELETE FROM metric_traffic_bucket WHERE bucket_start_unix < ?`,
+		`DELETE FROM metric_request_bucket WHERE bucket_start_unix < ?`,
+		`DELETE FROM metric_access_latency_bucket WHERE bucket_start_unix < ?`,
+		`DELETE FROM metric_probe_bucket WHERE bucket_start_unix < ?`,
+		`DELETE FROM metric_node_pool_bucket WHERE bucket_start_unix < ?`,
+		`DELETE FROM metric_lease_lifetime_bucket WHERE bucket_start_unix < ?`,
+	}
+
+	var total int64
+	for _, stmt := range statements {
+		res, err := r.db.Exec(stmt, cutoffUnix)
+		if err != nil {
+			return total, fmt.Errorf("metrics prune: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			// RowsAffected is best-effort; the delete still succeeded.
+			continue
+		}
+		total += affected
+	}
+	return total, nil
 }

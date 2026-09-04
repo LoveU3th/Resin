@@ -37,6 +37,18 @@ type RequestFinishedEvent struct {
 	ProxyType  ProxyType // 1=http forward, 2=reverse, 3=socks5 forward
 	IsConnect  bool
 	NetOK      bool
+	// FirstHopOK is true when the first node tried served the request. With
+	// failover in play, NetOK alone hides failing nodes: the request still
+	// succeeds, just on a different node. The gap between the two is the
+	// measure of how much failover is papering over.
+	//
+	// Only meaningful when ViaNode: a bypassed request never touches a node, so
+	// neither outcome says anything about node reliability.
+	FirstHopOK bool
+	// ViaNode is false for traffic that reached the target without a node
+	// (bypass rules). Such requests are excluded from first-hop statistics,
+	// otherwise they would count as flawless first hops and pull the rate up.
+	ViaNode    bool
 	DurationNs int64
 }
 
@@ -67,6 +79,14 @@ type RequestLogEntry struct {
 	UpstreamErrMsg      string // sanitized upstream error message
 	IngressBytes        int64  // bytes from upstream to client (header + body)
 	EgressBytes         int64  // bytes from client to upstream (header + body)
+
+	// FailoverAttempts is how many nodes the request was tried on. 1 means the
+	// first node served it; anything higher means earlier nodes failed.
+	FailoverAttempts int
+	// FailoverNodes lists the hex hashes of the nodes that were tried before the
+	// one that served the request. Empty on the common path, so it costs nothing
+	// in storage; capped so a pathological run cannot bloat a log row.
+	FailoverNodes string
 
 	// Optional detail payload (mainly for reverse proxy request logging).
 	ReqHeaders           []byte

@@ -128,7 +128,7 @@ func prepareLegacyStateBaseline(db *sql.DB, driver migratedb.Driver) error {
 		return setLegacyMigrationVersion(db, driver, stateVersionAddEmptyAccountBehavior)
 	case !hasEmptyBehavior && hasFixedHeader:
 		// This mixed state should not happen in normal upgrades. Repair it once.
-		if err := ensureTableColumn(
+		if err := EnsureTableColumn(
 			db,
 			"platforms",
 			"reverse_proxy_empty_account_behavior",

@@ -590,22 +590,29 @@ type PlatformSpecFilter struct {
 
 // NodeSummary is the API response for a node.
 type NodeSummary struct {
-	NodeHash                         string    `json:"node_hash"`
-	CreatedAt                        string    `json:"created_at"`
-	Enabled                          bool      `json:"enabled"`
-	DisplayTag                       string    `json:"display_tag,omitempty"`
-	HasOutbound                      bool      `json:"has_outbound"`
-	LastError                        string    `json:"last_error,omitempty"`
-	CircuitOpenSince                 *string   `json:"circuit_open_since"`
-	FailureCount                     int       `json:"failure_count"`
-	EgressIP                         string    `json:"egress_ip,omitempty"`
-	Region                           string    `json:"region,omitempty"`
-	LastEgressUpdate                 string    `json:"last_egress_update,omitempty"`
-	LastLatencyProbeAttempt          string    `json:"last_latency_probe_attempt,omitempty"`
-	LastAuthorityLatencyProbeAttempt string    `json:"last_authority_latency_probe_attempt,omitempty"`
-	ReferenceLatencyMs               *float64  `json:"reference_latency_ms,omitempty"`
-	LastEgressUpdateAttempt          string    `json:"last_egress_update_attempt,omitempty"`
-	Tags                             []NodeTag `json:"tags"`
+	NodeHash                         string   `json:"node_hash"`
+	CreatedAt                        string   `json:"created_at"`
+	Enabled                          bool     `json:"enabled"`
+	DisplayTag                       string   `json:"display_tag,omitempty"`
+	HasOutbound                      bool     `json:"has_outbound"`
+	LastError                        string   `json:"last_error,omitempty"`
+	CircuitOpenSince                 *string  `json:"circuit_open_since"`
+	FailureCount                     int      `json:"failure_count"`
+	EgressIP                         string   `json:"egress_ip,omitempty"`
+	Region                           string   `json:"region,omitempty"`
+	LastEgressUpdate                 string   `json:"last_egress_update,omitempty"`
+	LastLatencyProbeAttempt          string   `json:"last_latency_probe_attempt,omitempty"`
+	LastAuthorityLatencyProbeAttempt string   `json:"last_authority_latency_probe_attempt,omitempty"`
+	ReferenceLatencyMs               *float64 `json:"reference_latency_ms,omitempty"`
+	LastEgressUpdateAttempt          string   `json:"last_egress_update_attempt,omitempty"`
+	// SuccessRate is the node's health score: an EWMA of recent outcomes, 1
+	// meaning everything succeeded. Nil while there are too few observations to
+	// mean anything, so consumers can tell "healthy" from "not yet measured".
+	SuccessRate *float64 `json:"success_rate,omitempty"`
+	// HealthSamples is how many outcomes back the score. Compare against the
+	// configured minimum before treating the score as settled.
+	HealthSamples int       `json:"health_samples"`
+	Tags          []NodeTag `json:"tags"`
 }
 
 // IsHealthyAndEnabled follows the node-summary health rule used by API/UI
@@ -623,14 +630,17 @@ type NodeTag struct {
 
 func (s *ControlPlaneService) nodeEntryToSummary(h node.Hash, entry *node.NodeEntry) NodeSummary {
 	ns := NodeSummary{
-		NodeHash:     h.Hex(),
-		CreatedAt:    entry.CreatedAt.UTC().Format(time.RFC3339Nano),
-		Enabled:      true,
-		HasOutbound:  entry.HasOutbound(),
-		LastError:    entry.GetLastError(),
-		FailureCount: int(entry.FailureCount.Load()),
+		NodeHash:      h.Hex(),
+		CreatedAt:     entry.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Enabled:       true,
+		HasOutbound:   entry.HasOutbound(),
+		LastError:     entry.GetLastError(),
+		FailureCount:  int(entry.FailureCount.Load()),
+		HealthSamples: int(entry.HealthSamples()),
 	}
 
+	// Report the score later, once it is backed by enough observations — see the
+	// similar block below.
 	if s != nil && s.Pool != nil {
 		ns.Enabled = !s.Pool.IsNodeDisabled(h)
 		ns.DisplayTag = s.Pool.ResolveNodeDisplayTag(h)
@@ -668,6 +678,16 @@ func (s *ControlPlaneService) nodeEntryToSummary(h node.Hash, entry *node.NodeEn
 	}
 	if lastEgressAttempt := entry.LastEgressUpdateAttempt.Load(); lastEgressAttempt > 0 {
 		ns.LastEgressUpdateAttempt = time.Unix(0, lastEgressAttempt).UTC().Format(time.RFC3339Nano)
+	}
+
+	// Report the score only once it is backed by enough observations: an
+	// unmeasured node scores 1.0, and showing that would make "no data yet"
+	// look like "perfectly healthy". A threshold of 0 means no threshold, so it
+	// is deliberately not guarded with "minSamples > 0" — that would turn
+	// "show everything" into "show nothing".
+	if minSamples := healthMinSamples(s); ns.HealthSamples >= minSamples {
+		score := entry.HealthScore()
+		ns.SuccessRate = &score
 	}
 
 	// Build tags.
@@ -750,4 +770,18 @@ func (s *ControlPlaneService) PreviewFilter(req PreviewFilterRequest) ([]NodeSum
 		return true
 	})
 	return result, nil
+}
+
+// healthMinSamples returns how many observations a health score needs before it
+// is worth showing. Below this the score mostly reflects its initial value, so
+// exposing it would misrepresent unmeasured nodes as healthy ones.
+func healthMinSamples(s *ControlPlaneService) int {
+	if s == nil || s.RuntimeCfg == nil {
+		return 0
+	}
+	cfg := s.RuntimeCfg.Load()
+	if cfg == nil {
+		return 0
+	}
+	return cfg.HealthMinSamplesForFilter
 }

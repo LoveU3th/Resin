@@ -16,6 +16,15 @@ type Collector struct {
 type counters struct {
 	requests        atomic.Int64
 	successRequests atomic.Int64
+	// nodeRequests counts requests that went through a node. It is the
+	// denominator for first-hop success: bypassed traffic never touches a node,
+	// so including it would hide failures behind flawless non-node requests.
+	nodeRequests atomic.Int64
+	// firstHopSuccess counts requests served by the first node tried. Compared
+	// with nodeRequests, it exposes what failover is hiding: a node that always
+	// fails the first attempt still produces a successful request, so the final
+	// success rate looks fine while this one drops.
+	firstHopSuccess atomic.Int64
 	ingressBytes    atomic.Int64
 	egressBytes     atomic.Int64
 	inboundConns    atomic.Int64
@@ -39,6 +48,8 @@ type counters struct {
 type CountersSnapshot struct {
 	Requests        int64
 	SuccessRequests int64
+	NodeRequests    int64
+	FirstHopSuccess int64
 	IngressBytes    int64
 	EgressBytes     int64
 	InboundConns    int64
@@ -89,10 +100,34 @@ func (c *Collector) getOrCreatePlatform(platformID string) *counters {
 }
 
 // RecordRequest records a completed request.
-func (c *Collector) RecordRequest(platformID string, success bool, latencyMs int64, isConnect bool) {
+// RecordRequest records one completed request.
+//
+// firstHopOK must be true only when the first node tried served it. That is the
+// signal failover would otherwise erase: a broken node still yields successful
+// requests once another node picks them up.
+// RecordRequest records one completed request.
+//
+// firstHopOK must be true only when the first node tried served the request, and
+// viaNode must be false for traffic that bypassed the node pool. Both matter:
+// failover hides failing nodes behind eventual success, and bypassed traffic
+// would otherwise be counted as a perfect first hop.
+func (c *Collector) RecordRequest(
+	platformID string,
+	success bool,
+	latencyMs int64,
+	isConnect bool,
+	firstHopOK bool,
+	viaNode bool,
+) {
 	c.global.requests.Add(1)
 	if success {
 		c.global.successRequests.Add(1)
+	}
+	if viaNode {
+		c.global.nodeRequests.Add(1)
+		if firstHopOK {
+			c.global.firstHopSuccess.Add(1)
+		}
 	}
 	if !isConnect && latencyMs >= 0 {
 		c.recordLatency(c.global, latencyMs)
@@ -102,6 +137,12 @@ func (c *Collector) RecordRequest(platformID string, success bool, latencyMs int
 		pc.requests.Add(1)
 		if success {
 			pc.successRequests.Add(1)
+		}
+		if viaNode {
+			pc.nodeRequests.Add(1)
+			if firstHopOK {
+				pc.firstHopSuccess.Add(1)
+			}
 		}
 		if !isConnect && latencyMs >= 0 {
 			c.recordLatency(pc, latencyMs)
@@ -226,6 +267,8 @@ func snapshot(ct *counters) CountersSnapshot {
 	s := CountersSnapshot{
 		Requests:        ct.requests.Load(),
 		SuccessRequests: ct.successRequests.Load(),
+		NodeRequests:    ct.nodeRequests.Load(),
+		FirstHopSuccess: ct.firstHopSuccess.Load(),
 		IngressBytes:    ct.ingressBytes.Load(),
 		EgressBytes:     ct.egressBytes.Load(),
 		InboundConns:    ct.inboundConns.Load(),

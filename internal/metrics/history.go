@@ -60,7 +60,8 @@ func (m *Manager) QueryHistoryRequests(fromUnix, toUnix int64, platformID string
 		return nil, err
 	}
 
-	currentBucketStart, currentTotal, currentSuccess := m.bucket.SnapshotRequests(platformID)
+	// One call, so total and firstHop cannot be read at different instants.
+	currentBucketStart, currentTotal, currentSuccess, currentNode, currentFirstHop := m.bucket.RequestCounts(platformID)
 	if bucketInRangeUnix(currentBucketStart, fromUnix, toUnix) {
 		merged := false
 		for i := range rows {
@@ -69,9 +70,12 @@ func (m *Manager) QueryHistoryRequests(fromUnix, toUnix int64, platformID string
 			}
 			rows[i].TotalRequests += currentTotal
 			rows[i].SuccessRequests += currentSuccess
+			rows[i].NodeRequests += currentNode
+			rows[i].FirstHopSuccess += currentFirstHop
 			if rows[i].SuccessRequests > rows[i].TotalRequests {
 				rows[i].SuccessRequests = rows[i].TotalRequests
 			}
+			clampFirstHop(&rows[i])
 			merged = true
 			break
 		}
@@ -81,6 +85,8 @@ func (m *Manager) QueryHistoryRequests(fromUnix, toUnix int64, platformID string
 				PlatformID:      platformID,
 				TotalRequests:   currentTotal,
 				SuccessRequests: currentSuccess,
+				NodeRequests:    currentNode,
+				FirstHopSuccess: currentFirstHop,
 			})
 			sort.Slice(rows, func(i, j int) bool { return rows[i].BucketStartUnix < rows[j].BucketStartUnix })
 		}
@@ -279,4 +285,15 @@ func mergeLatencyBuckets(base, delta []int64) []int64 {
 		out[i] += delta[i]
 	}
 	return out
+}
+
+// clampFirstHop keeps a bucket's first-hop counters internally consistent after
+// merging, so a rate derived from them can never exceed 1.
+func clampFirstHop(row *RequestBucketRow) {
+	if row.NodeRequests > row.TotalRequests {
+		row.NodeRequests = row.TotalRequests
+	}
+	if row.FirstHopSuccess > row.NodeRequests {
+		row.FirstHopSuccess = row.NodeRequests
+	}
 }

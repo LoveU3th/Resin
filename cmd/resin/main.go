@@ -177,6 +177,7 @@ type metricsManagerSettings struct {
 	LatencyBinMs                int
 	LatencyOverflowMs           int
 	BucketSeconds               int
+	RetentionDays               int
 	ThroughputIntervalSec       int
 	ThroughputRealtimeCapacity  int
 	ConnectionsIntervalSec      int
@@ -190,6 +191,7 @@ func deriveMetricsManagerSettings(envCfg *config.EnvConfig) metricsManagerSettin
 		LatencyBinMs:                envCfg.MetricLatencyBinWidthMS,
 		LatencyOverflowMs:           envCfg.MetricLatencyBinOverflowMS,
 		BucketSeconds:               envCfg.MetricBucketSeconds,
+		RetentionDays:               envCfg.MetricRetentionDays,
 		ThroughputIntervalSec:       envCfg.MetricThroughputIntervalSeconds,
 		ThroughputRealtimeCapacity:  realtimeCapacity(envCfg.MetricThroughputRetentionSeconds, envCfg.MetricThroughputIntervalSeconds),
 		ConnectionsIntervalSec:      envCfg.MetricConnectionsIntervalSeconds,

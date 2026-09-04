@@ -314,6 +314,7 @@ func (a *resinApp) initObservability() error {
 		LatencyBinMs:                metricsCfg.LatencyBinMs,
 		LatencyOverflowMs:           metricsCfg.LatencyOverflowMs,
 		BucketSeconds:               metricsCfg.BucketSeconds,
+		RetentionDays:               metricsCfg.RetentionDays,
 		ThroughputRealtimeCapacity:  metricsCfg.ThroughputRealtimeCapacity,
 		ThroughputIntervalSec:       metricsCfg.ThroughputIntervalSec,
 		ConnectionsRealtimeCapacity: metricsCfg.ConnectionsRealtimeCapacity,

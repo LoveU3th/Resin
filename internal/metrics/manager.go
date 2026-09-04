@@ -29,10 +29,13 @@ type RuntimeStatsProvider interface {
 
 // ManagerConfig configures the MetricsManager.
 type ManagerConfig struct {
-	Repo                        *MetricsRepo
-	LatencyBinMs                int
-	LatencyOverflowMs           int
-	BucketSeconds               int
+	Repo              *MetricsRepo
+	LatencyBinMs      int
+	LatencyOverflowMs int
+	BucketSeconds     int
+	// RetentionDays bounds how long metric buckets stay on disk; 0 keeps them
+	// forever.
+	RetentionDays               int
 	ThroughputRealtimeCapacity  int
 	ThroughputIntervalSec       int
 	ConnectionsRealtimeCapacity int
@@ -60,6 +63,9 @@ type Manager struct {
 	connectionsInterval time.Duration
 	leasesInterval      time.Duration
 	bucketSeconds       int
+	// retentionDays bounds how long metric buckets stay on disk. 0 disables
+	// pruning.
+	retentionDays int
 
 	// Previous cumulative byte counts for delta calculation (throughput B/s).
 	prevIngressBytes int64
@@ -102,6 +108,8 @@ type nodePoolSnapshot struct {
 type bucketCounterBaseline struct {
 	Requests     int64
 	Success      int64
+	NodeRequests int64
+	FirstHop     int64
 	ProbeEgress  int64
 	ProbeLatency int64
 }
@@ -131,6 +139,10 @@ func NewManager(cfg ManagerConfig) *Manager {
 	if bucketSec <= 0 {
 		bucketSec = 300
 	}
+	retentionDays := cfg.RetentionDays
+	if retentionDays < 0 {
+		retentionDays = 0
+	}
 	return &Manager{
 		collector:           NewCollector(cfg.LatencyBinMs, cfg.LatencyOverflowMs),
 		bucket:              NewBucketAggregator(bucketSec),
@@ -143,6 +155,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		connectionsInterval: time.Duration(connectionsSec) * time.Second,
 		leasesInterval:      time.Duration(leasesSec) * time.Second,
 		bucketSeconds:       bucketSec,
+		retentionDays:       retentionDays,
 		prevBucketPlatforms: make(map[string]bucketCounterBaseline),
 		leaseSamplesCh:      make(chan leaseLifetimeSample, leaseSampleQueueSize),
 		stopCh:              make(chan struct{}),
@@ -186,7 +199,7 @@ func (m *Manager) Stop() {
 // OnRequestFinished records request completion metrics.
 func (m *Manager) OnRequestFinished(ev proxy.RequestFinishedEvent) {
 	latencyMs := ev.DurationNs / 1e6
-	m.collector.RecordRequest(ev.PlatformID, ev.NetOK, latencyMs, ev.IsConnect)
+	m.collector.RecordRequest(ev.PlatformID, ev.NetOK, latencyMs, ev.IsConnect, ev.FirstHopOK, ev.ViaNode)
 }
 
 // OnTrafficDelta records global traffic bytes (implements proxy.MetricsEventSink).
@@ -392,10 +405,21 @@ func (m *Manager) bucketLoop() {
 	ticker := time.NewTicker(time.Duration(m.bucketSeconds) * time.Second)
 	defer ticker.Stop()
 
+	// Pruning is tied to the bucket loop rather than its own timer: it only ever
+	// removes whole buckets, so doing it after a flush keeps the cutoff aligned
+	// to bucket boundaries.
+	pruneEvery := m.pruneEveryBuckets()
+	sincePrune := 0
+
 	for {
 		select {
 		case <-ticker.C:
 			m.flushBucket()
+			sincePrune++
+			if pruneEvery > 0 && sincePrune >= pruneEvery {
+				sincePrune = 0
+				m.pruneOldBuckets()
+			}
 		case <-m.stopCh:
 			return
 		}
@@ -464,8 +488,16 @@ func (m *Manager) aggregateCollectorDeltasIntoBucketLocked() {
 
 	globalRequestsDelta := nonNegativeDelta(globalCurrent.Requests, globalBase.Requests)
 	globalSuccessDelta := nonNegativeDelta(globalCurrent.Success, globalBase.Success)
+	globalNodeDelta := nonNegativeDelta(globalCurrent.NodeRequests, globalBase.NodeRequests)
+	globalFirstHopDelta := nonNegativeDelta(globalCurrent.FirstHop, globalBase.FirstHop)
 	if globalSuccessDelta > globalRequestsDelta {
 		globalSuccessDelta = globalRequestsDelta
+	}
+	if globalNodeDelta > globalRequestsDelta {
+		globalNodeDelta = globalRequestsDelta
+	}
+	if globalFirstHopDelta > globalNodeDelta {
+		globalFirstHopDelta = globalNodeDelta
 	}
 	globalProbeDelta := nonNegativeDelta(
 		globalCurrent.ProbeEgress+globalCurrent.ProbeLatency,
@@ -477,6 +509,8 @@ func (m *Manager) aggregateCollectorDeltasIntoBucketLocked() {
 
 	var sumPlatformRequests int64
 	var sumPlatformSuccess int64
+	var sumNodeRequests int64
+	var sumFirstHop int64
 
 	for pid, snap := range currentPlatforms {
 		cur := baselineFromSnapshot(snap)
@@ -485,25 +519,43 @@ func (m *Manager) aggregateCollectorDeltasIntoBucketLocked() {
 
 		requestDelta := nonNegativeDelta(cur.Requests, prev.Requests)
 		successDelta := nonNegativeDelta(cur.Success, prev.Success)
+		nodeDelta := nonNegativeDelta(cur.NodeRequests, prev.NodeRequests)
+		firstHopDelta := nonNegativeDelta(cur.FirstHop, prev.FirstHop)
 		if successDelta > requestDelta {
 			successDelta = requestDelta
 		}
+		if nodeDelta > requestDelta {
+			nodeDelta = requestDelta
+		}
+		if firstHopDelta > nodeDelta {
+			firstHopDelta = nodeDelta
+		}
 
 		if requestDelta != 0 {
-			m.bucket.AddRequestCounts(pid, requestDelta, successDelta)
+			m.bucket.AddRequestCounts(pid, requestDelta, successDelta, nodeDelta, firstHopDelta)
 		}
 
 		sumPlatformRequests += requestDelta
 		sumPlatformSuccess += successDelta
+		sumNodeRequests += nodeDelta
+		sumFirstHop += firstHopDelta
 	}
 
 	globalOnlyRequests := nonNegativeDelta(globalRequestsDelta, sumPlatformRequests)
 	globalOnlySuccess := nonNegativeDelta(globalSuccessDelta, sumPlatformSuccess)
+	globalOnlyNode := nonNegativeDelta(globalNodeDelta, sumNodeRequests)
+	globalOnlyFirstHop := nonNegativeDelta(globalFirstHopDelta, sumFirstHop)
 	if globalOnlySuccess > globalOnlyRequests {
 		globalOnlySuccess = globalOnlyRequests
 	}
+	if globalOnlyNode > globalOnlyRequests {
+		globalOnlyNode = globalOnlyRequests
+	}
+	if globalOnlyFirstHop > globalOnlyNode {
+		globalOnlyFirstHop = globalOnlyNode
+	}
 	if globalOnlyRequests != 0 {
-		m.bucket.AddRequestCounts("", globalOnlyRequests, globalOnlySuccess)
+		m.bucket.AddRequestCounts("", globalOnlyRequests, globalOnlySuccess, globalOnlyNode, globalOnlyFirstHop)
 	}
 
 	if globalProbeDelta != 0 {
@@ -570,6 +622,8 @@ func baselineFromSnapshot(s CountersSnapshot) bucketCounterBaseline {
 	return bucketCounterBaseline{
 		Requests:     s.Requests,
 		Success:      s.SuccessRequests,
+		NodeRequests: s.NodeRequests,
+		FirstHop:     s.FirstHopSuccess,
 		ProbeEgress:  s.ProbeEgress,
 		ProbeLatency: s.ProbeLatency,
 	}
@@ -691,5 +745,37 @@ func (m *Manager) drainPendingTasks(maxAttempts int, retryDelay time.Duration) {
 			return
 		}
 		m.popPendingTask()
+	}
+}
+
+// pruneEveryBuckets returns how many flushes to skip between prunes. Pruning
+// once an hour is plenty for a retention window measured in days, and keeps the
+// cost off every tick.
+func (m *Manager) pruneEveryBuckets() int {
+	if m == nil || m.retentionDays <= 0 || m.bucketSeconds <= 0 {
+		return 0
+	}
+	every := 3600 / m.bucketSeconds
+	if every < 1 {
+		every = 1
+	}
+	return every
+}
+
+// pruneOldBuckets removes metric rows older than the retention window. Failures
+// are logged rather than returned: the loop must keep running, and the next
+// prune will retry.
+func (m *Manager) pruneOldBuckets() {
+	if m == nil || m.retentionDays <= 0 || m.repo == nil {
+		return
+	}
+	cutoff := time.Now().AddDate(0, 0, -m.retentionDays).Unix()
+	removed, err := m.repo.PruneOlderThan(cutoff)
+	if err != nil {
+		log.Printf("[metrics] prune failed: %v", err)
+		return
+	}
+	if removed > 0 {
+		log.Printf("[metrics] pruned %d rows older than %d days", removed, m.retentionDays)
 	}
 }

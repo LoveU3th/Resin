@@ -3,9 +3,11 @@ package proxy
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/routing"
 )
 
@@ -40,8 +42,10 @@ func newRequestLifecycleFromMetadata(
 		startedAt: now,
 		events:    events,
 		finished: RequestFinishedEvent{
-			ProxyType: proxyType,
-			IsConnect: isConnect,
+			ProxyType:  proxyType,
+			IsConnect:  isConnect,
+			FirstHopOK: true,
+			ViaNode:    true,
 		},
 		log: RequestLogEntry{
 			StartedAtNs: now.UnixNano(),
@@ -77,6 +81,12 @@ func (l *requestLifecycle) finish() {
 		l.log.RespBody = l.respBodyCapture.Payload()
 		l.log.RespBodyLen = l.respBodyCapture.TotalLen()
 		l.log.RespBodyTruncated = l.respBodyCapture.Truncated()
+	}
+
+	// A request that did not succeed cannot have succeeded on the first hop,
+	// however it got there.
+	if !l.finished.NetOK {
+		l.finished.FirstHopOK = false
 	}
 
 	durationNs := time.Since(l.startedAt).Nanoseconds()
@@ -180,4 +190,50 @@ func (l *requestLifecycle) setRouteResult(result routing.RouteResult) {
 	l.log.NodeHash = result.NodeHash.Hex()
 	l.log.NodeTag = result.NodeTag
 	l.log.EgressIP = result.EgressIP.String()
+}
+
+// setWithoutNode marks the request as reaching its target without a node, so it
+// stays out of first-hop statistics.
+func (l *requestLifecycle) setWithoutNode() {
+	l.finished.ViaNode = false
+	l.finished.FirstHopOK = false
+}
+
+// recordFailover records that the request had to be retried on other nodes.
+//
+// The count matters more than the list: requests with attempts > 1 succeeded
+// only after a failure, and an aggregate over them is the only way to see nodes
+// that are quietly broken — the final success rate looks fine either way.
+func (l *requestLifecycle) recordFailover(attempts int, nodes []node.Hash) {
+	if attempts <= 1 && len(nodes) == 0 {
+		return
+	}
+	l.log.FailoverAttempts = attempts
+	l.log.FailoverNodes = formatFailoverNodes(nodes)
+	// Something had to be retried, so the first node did not serve it — even if
+	// a later one did.
+	l.finished.FirstHopOK = false
+}
+
+// maxFailoverNodesLogged bounds how much of a pathological retry chain ends up
+// in one log row.
+const maxFailoverNodesLogged = 3
+
+func formatFailoverNodes(nodes []node.Hash) string {
+	if len(nodes) == 0 {
+		return ""
+	}
+	limit := len(nodes)
+	if limit > maxFailoverNodesLogged {
+		limit = maxFailoverNodesLogged
+	}
+	parts := make([]string, 0, limit)
+	for _, h := range nodes[:limit] {
+		hex := h.Hex()
+		if len(hex) > 16 {
+			hex = hex[:16]
+		}
+		parts = append(parts, hex)
+	}
+	return strings.Join(parts, ",")
 }

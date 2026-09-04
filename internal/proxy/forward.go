@@ -366,6 +366,10 @@ func (p *ForwardProxy) forwardDirect(
 	r *http.Request,
 	lifecycle *requestLifecycle,
 ) {
+	// Bypassed traffic reaches the target without a node, so it must not appear
+	// in first-hop statistics: counting it as a flawless first hop would lift
+	// the rate and hide real node failures.
+	lifecycle.setWithoutNode()
 	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
 	outReq := prepareForwardOutboundRequest(r)
 	outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamTrace.clientTrace()))
@@ -475,6 +479,9 @@ func (p *ForwardProxy) forwardViaNodes(
 		attempt := result.Value
 		defer attempt.resp.Body.Close()
 		lifecycle.setRouteResult(result.Route)
+		// FailedNodes excludes the node that served the request, so it is exactly
+		// the set of nodes this request had to give up on.
+		lifecycle.recordFailover(result.Attempts, result.FailedNodes)
 		if attempt.trace.shouldCommitEgress() {
 			lifecycle.addEgressBytes(attempt.headerBytes)
 			if attempt.bodyCounter != nil {
