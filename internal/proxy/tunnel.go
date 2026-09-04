@@ -22,6 +22,12 @@ type tunnelDeps struct {
 	health      HealthRecorder
 	metricsSink MetricsEventSink
 	bypass      *TargetBypassMatcher
+	// dialTimeout bounds one outbound dial. CONNECT dials go straight to the
+	// outbound rather than through an http.Transport, so without this a node
+	// that never answers parks the goroutine and its fd indefinitely.
+	dialTimeout time.Duration
+	// failover controls whether a failed dial is retried on another node.
+	failover FailoverConfig
 }
 
 type preparedTunnel struct {
@@ -77,42 +83,116 @@ func prepareConnectTunnel(
 		return prepareDirectConnectTunnel(ctx, deps, target)
 	}
 
-	routed, routeErr := resolveRoutedOutbound(deps.router, deps.pool, platformName, account, target)
-	if routeErr != nil {
-		return tunnelPrepareResult{proxyErr: routeErr}
-	}
-
 	domain := netutil.ExtractDomain(target)
-	nodeHashRaw := routed.Route.NodeHash
-	if deps.health != nil {
-		go deps.health.RecordPassiveLatency(nodeHashRaw, domain, nil)
-	}
 
-	rawConn, err := routed.Outbound.DialContext(ctx, "tcp", M.ParseSocksaddr(target))
-	if err != nil {
-		proxyErr := classifyConnectError(err)
-		if proxyErr == nil {
-			return tunnelPrepareResult{
-				route:    routed.Route,
-				canceled: true,
+	result := runFailover(ctx, FailoverParams[net.Conn]{
+		Config: deps.failover,
+		Resolve: func(exclude []node.Hash) (routedOutbound, *ProxyError) {
+			return resolveRoutedOutboundExcluding(
+				deps.router, deps.pool, platformName, account, target, exclude)
+		},
+		Run: func(attemptCtx context.Context, routed routedOutbound, st *AttemptState) (net.Conn, error) {
+			if deps.health != nil {
+				go deps.health.RecordPassiveLatency(routed.Route.NodeHash, domain, nil)
 			}
-		}
-		if deps.health != nil {
-			recordPassiveResultAsync(deps.health, routed.Route, false)
-		}
-		return tunnelPrepareResult{
-			route:         routed.Route,
-			proxyErr:      proxyErr,
-			upstreamStage: "connect_dial",
-			upstreamErr:   err,
-		}
+			return dialTunnelConn(attemptCtx, deps, routed, target, st)
+		},
+		Classify: classifyEstablishmentFailure,
+		Cleanup: func(conn net.Conn) {
+			if conn != nil {
+				conn.Close()
+			}
+		},
+		OnAttempt: func(res routing.RouteResult, verdict attemptVerdict) {
+			if deps.health == nil {
+				return
+			}
+			if verdict.retryable {
+				recordPassiveStageResultAsync(deps.health, res, node.PassiveStageConnect, false)
+			}
+		},
+	})
+
+	if result.Value != nil {
+		conn := result.Value
+		routed := result.Route
+		return buildPreparedTunnel(ctx, deps, routed, conn, target, domain)
 	}
 
-	// The tunnel is established at this point, so outcomes from here on describe
-	// data transfer rather than reachability.
+	if result.RouteErr != nil {
+		return tunnelPrepareResult{proxyErr: result.RouteErr}
+	}
+
+	// report the last failure against the node it belongs to
+	var route routing.RouteResult
+	if len(result.FailedNodes) > 0 {
+		route.NodeHash = result.FailedNodes[len(result.FailedNodes)-1]
+	}
+
+	proxyErr := classifyConnectError(result.LastErr)
+	if proxyErr == nil {
+		return tunnelPrepareResult{route: route, canceled: true}
+	}
+	if deps.health != nil {
+		recordPassiveStageResultAsync(deps.health, route, node.PassiveStageConnect, false)
+	}
+	return tunnelPrepareResult{
+		route:         route,
+		proxyErr:      proxyErr,
+		upstreamStage: "connect_dial",
+		upstreamErr:   result.LastErr,
+	}
+}
+
+// dialTunnelConn dials the target through a node with a bounded timeout.
+//
+// The cancel is deferred to connection close rather than run here: some outbound
+// protocols bind a connection's lifetime to its dial context, so cancelling
+// immediately would tear down the tunnel we just built.
+func dialTunnelConn(
+	ctx context.Context,
+	deps tunnelDeps,
+	routed routedOutbound,
+	target string,
+	st *AttemptState,
+) (net.Conn, error) {
+	st.dialAttempted.Store(true)
+
+	dialCtx, cancel := context.WithCancel(ctx)
+	var timer *time.Timer
+	if deps.dialTimeout > 0 {
+		timer = time.AfterFunc(deps.dialTimeout, cancel)
+	}
+
+	conn, err := routed.Outbound.DialContext(dialCtx, "tcp", M.ParseSocksaddr(target))
+	if err != nil {
+		if timer != nil {
+			timer.Stop()
+		}
+		cancel()
+		return nil, err
+	}
+	if timer != nil {
+		timer.Stop()
+	}
+	st.dialSucceeded.Store(true)
+	return &dialCancelConn{Conn: conn, cancel: cancel}, nil
+}
+
+// buildPreparedTunnel wraps a freshly dialed tunnel connection for relaying.
+// Everything after the dial describes data transfer rather than reachability,
+// which is how its outcomes are attributed.
+func buildPreparedTunnel(
+	_ context.Context,
+	deps tunnelDeps,
+	route routing.RouteResult,
+	rawConn net.Conn,
+	target string,
+	domain string,
+) tunnelPrepareResult {
 	recordResult := func(ok bool) {
 		if deps.health != nil {
-			recordPassiveStageResultAsync(deps.health, routed.Route, node.PassiveStageTransfer, ok)
+			recordPassiveStageResultAsync(deps.health, route, node.PassiveStageTransfer, ok)
 		}
 	}
 
@@ -124,12 +204,12 @@ func prepareConnectTunnel(
 
 	upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 		if deps.health != nil {
-			deps.health.RecordPassiveLatency(nodeHashRaw, domain, &latency)
+			deps.health.RecordPassiveLatency(route.NodeHash, domain, &latency)
 		}
 	})
 
 	return tunnelPrepareResult{
-		route: routed.Route,
+		route: route,
 		session: &preparedTunnel{
 			upstreamConn: upstreamConn,
 			recordResult: recordResult,

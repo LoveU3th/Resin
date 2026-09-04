@@ -93,6 +93,10 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"circuit_max_cooldown":                     true,
 	"health_recovery_floor_percent":            true,
 	"health_transfer_failure_weight_percent":   true,
+	"failover_enabled":                         true,
+	"failover_max_attempts":                    true,
+	"failover_attempt_budget":                  true,
+	"failover_total_budget":                    true,
 	"max_latency_test_interval":                true,
 	"max_authority_latency_test_interval":      true,
 	"max_egress_test_interval":                 true,
@@ -248,6 +252,18 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.HealthTransferFailureWeightPercent < 0 || cfg.HealthTransferFailureWeightPercent > 100 {
 		return invalidArg("health_transfer_failure_weight_percent: must be between 0 and 100")
+	}
+	if cfg.FailoverMaxAttempts < 1 {
+		return invalidArg("failover_max_attempts: must be at least 1 (1 means no retry)")
+	}
+	if cfg.FailoverAttemptBudget < 0 {
+		return invalidArg("failover_attempt_budget: must not be negative (0 disables it)")
+	}
+	if cfg.FailoverTotalBudget < 0 {
+		return invalidArg("failover_total_budget: must not be negative (0 disables it)")
+	}
+	if cfg.FailoverTotalBudget > 0 && cfg.FailoverAttemptBudget > cfg.FailoverTotalBudget {
+		return invalidArg("failover_attempt_budget must not exceed failover_total_budget")
 	}
 	if cfg.CacheFlushDirtyThreshold < 0 {
 		return invalidArg("cache_flush_dirty_threshold: must be non-negative")

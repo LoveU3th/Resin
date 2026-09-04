@@ -33,6 +33,9 @@ type ForwardProxyConfig struct {
 	// StickyAccountSource derives the sticky account from the request target
 	// when the client supplies no account. See platform.NormalizeForwardStickyAccount.
 	StickyAccountSource string
+	// Failover controls request-level retries on other nodes. Left zero-valued
+	// it means no retries, preserving the previous behaviour.
+	Failover FailoverConfig
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
@@ -52,6 +55,7 @@ type ForwardProxy struct {
 	directOnce          sync.Once
 	bypass              *TargetBypassMatcher
 	stickyAccountSource platform.ForwardStickyAccount
+	failover            FailoverConfig
 }
 
 // NewForwardProxy creates a new forward proxy handler.
@@ -82,6 +86,7 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		transportPool:       transportPool,
 		bypass:              NewTargetBypassMatcher(cfg.ProxyBypassRules),
 		stickyAccountSource: stickyAccountSource,
+		failover:            cfg.Failover,
 	}
 }
 
@@ -335,65 +340,200 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	defer lifecycle.finish()
 	lifecycle.setAccount(account)
 
-	var route routing.RouteResult
-	var hasRoute bool
-	var transport *http.Transport
 	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
-		transport = p.directHTTPTransport()
-	} else {
-		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)
-		if routeErr != nil {
-			lifecycle.setProxyError(routeErr)
-			lifecycle.setHTTPStatus(routeErr.HTTPCode)
-			writeProxyError(w, routeErr)
-			return
-		}
-		route = routed.Route
-		hasRoute = true
-		lifecycle.setRouteResult(route)
-		if p.health != nil {
-			go p.health.RecordPassiveLatency(route.NodeHash, netutil.ExtractDomain(r.Host), nil)
-		}
-		transport = p.outboundHTTPTransport(routed)
+		// Bypassed traffic has no node to fail over to.
+		p.forwardDirect(w, r, lifecycle)
+		return
 	}
-	outReq := prepareForwardOutboundRequest(r)
+	p.forwardViaNodes(w, r, lifecycle, platName, account)
+}
+
+// forwardAttempt carries one attempt's response together with the counters that
+// belong to it. Returning them instead of stashing them in the enclosing scope
+// matters: an abandoned attempt is still running in the background, and letting
+// it write to shared counters would race with the attempt that replaces it.
+type forwardAttempt struct {
+	resp        *http.Response
+	trace       *upstreamRequestTrace
+	headerBytes int64
+	bodyCounter *countingReadCloser
+}
+
+// forwardDirect sends a bypassed request through the local transport. There is
+// no node involved, so there is nothing to fail over to.
+func (p *ForwardProxy) forwardDirect(
+	w http.ResponseWriter,
+	r *http.Request,
+	lifecycle *requestLifecycle,
+) {
 	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
+	outReq := prepareForwardOutboundRequest(r)
 	outReq = outReq.WithContext(httptrace.WithClientTrace(outReq.Context(), upstreamTrace.clientTrace()))
-	pendingEgressHeaderBytes := headerWireLen(outReq.Header)
-	var egressBodyCounter *countingReadCloser
-	if outReq.Body != nil && outReq.Body != http.NoBody {
-		egressBodyCounter = newCountingReadCloser(outReq.Body)
-		outReq.Body = egressBodyCounter
+	// Guarded assignment, not wrapForwardBody(...) directly: assigning a nil
+	// *countingReadCloser to the io.ReadCloser field yields a non-nil interface
+	// holding a nil pointer, and net/http then calls Read on it and panics.
+	if bodyCounter := wrapForwardBody(outReq.Body); bodyCounter != nil {
+		outReq.Body = bodyCounter
 	}
 
-	// Forward the request.
-	resp, err := transport.RoundTrip(outReq)
-	if upstreamTrace.shouldCommitEgress() {
-		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
-		if egressBodyCounter != nil {
-			lifecycle.addEgressBytes(egressBodyCounter.Total())
-		}
-	}
+	resp, err := p.directHTTPTransport().RoundTrip(outReq)
 	if err != nil {
 		proxyErr := classifyUpstreamError(err)
 		if proxyErr == nil {
-			// context.Canceled — skip health recording, close silently.
-			// Request ended due to client-side cancellation before upstream
-			// response; treat as net-ok in request log semantics.
+			// The client went away; not a failure worth recording.
 			lifecycle.setNetOK(true)
 			return
 		}
 		lifecycle.setProxyError(proxyErr)
 		lifecycle.setUpstreamError("forward_roundtrip", err)
 		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
-		if hasRoute {
-			recordPassiveResultAsync(p.health, route, false)
-		}
 		writeProxyError(w, proxyErr)
 		return
 	}
 	defer resp.Body.Close()
+	p.writeForwardUpstreamResponse(w, r, lifecycle, resp, routing.RouteResult{}, false)
+}
 
+// forwardViaNodes sends a request through the node pool, retrying on a different
+// node only when the request provably never reached the first one.
+func (p *ForwardProxy) forwardViaNodes(
+	w http.ResponseWriter,
+	r *http.Request,
+	lifecycle *requestLifecycle,
+	platName, account string,
+) {
+	domain := netutil.ExtractDomain(r.Host)
+
+	cfg := p.failover
+	outReq := prepareForwardOutboundRequest(r)
+	// A body cannot be replayed: server-side requests never carry GetBody, so
+	// anything with a body can only honestly be sent once.
+	if !cfg.Enabled || replayUnsafe(outReq) {
+		cfg.MaxAttempts = 1
+	}
+
+	result := runFailover(r.Context(), FailoverParams[*forwardAttempt]{
+		Config: cfg,
+		Resolve: func(exclude []node.Hash) (routedOutbound, *ProxyError) {
+			return resolveRoutedOutboundExcluding(p.router, p.pool, platName, account, r.Host, exclude)
+		},
+		Run: func(ctx context.Context, routed routedOutbound, st *AttemptState) (*forwardAttempt, error) {
+			// Trace and counters are per attempt: sharing them across attempts
+			// would report the same bytes and first-byte delay several times.
+			trace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
+			attemptReq := outReq.Clone(withAttemptState(ctx, st))
+			attemptReq = attemptReq.WithContext(
+				httptrace.WithClientTrace(attemptReq.Context(), trace.clientTrace()))
+			// Separate trace so the attempt learns whether the transport handed
+			// over a connection, and whether that connection was pooled.
+			attemptReq = attemptReq.WithContext(
+				httptrace.WithClientTrace(attemptReq.Context(), st.clientTrace()))
+			var counter *countingReadCloser
+			if bodyCounter := wrapForwardBody(attemptReq.Body); bodyCounter != nil {
+				counter = bodyCounter
+				attemptReq.Body = bodyCounter
+			}
+
+			if p.health != nil {
+				go p.health.RecordPassiveLatency(routed.Route.NodeHash, domain, nil)
+			}
+			resp, err := p.outboundHTTPTransport(routed).RoundTrip(attemptReq)
+			if err != nil {
+				return nil, err
+			}
+			return &forwardAttempt{
+				resp:        resp,
+				trace:       trace,
+				headerBytes: headerWireLen(attemptReq.Header),
+				bodyCounter: counter,
+			}, nil
+		},
+		Classify: classifyEstablishmentFailure,
+		Cleanup: func(attempt *forwardAttempt) {
+			if attempt != nil && attempt.resp != nil {
+				attempt.resp.Body.Close()
+			}
+		},
+		OnAttempt: func(res routing.RouteResult, verdict attemptVerdict) {
+			if p.health == nil {
+				return
+			}
+			if verdict.retryable {
+				// The node never received the request, so it failed to serve it.
+				recordPassiveStageResultAsync(p.health, res, node.PassiveStageConnect, false)
+				return
+			}
+			if verdict.deadConn {
+				// Weight the node down without touching the breaker: a batch of
+				// pooled connections ageing out together should not evict a node.
+				recordConnDropAsync(p.health, res)
+			}
+		},
+	})
+
+	if result.Value != nil {
+		attempt := result.Value
+		defer attempt.resp.Body.Close()
+		lifecycle.setRouteResult(result.Route)
+		if attempt.trace.shouldCommitEgress() {
+			lifecycle.addEgressBytes(attempt.headerBytes)
+			if attempt.bodyCounter != nil {
+				lifecycle.addEgressBytes(attempt.bodyCounter.Total())
+			}
+		}
+		p.writeForwardUpstreamResponse(w, r, lifecycle, attempt.resp, result.Route, true)
+		return
+	}
+
+	if result.RouteErr != nil {
+		lifecycle.setProxyError(result.RouteErr)
+		lifecycle.setHTTPStatus(result.RouteErr.HTTPCode)
+		writeProxyError(w, result.RouteErr)
+		return
+	}
+
+	proxyErr := classifyUpstreamError(result.LastErr)
+	if proxyErr == nil {
+		// The client went away before the upstream responded, so this is not a
+		// node failure and health must be left alone.
+		lifecycle.setNetOK(true)
+		return
+	}
+	lifecycle.setProxyError(proxyErr)
+	lifecycle.setUpstreamError("forward_roundtrip", result.LastErr)
+	lifecycle.setHTTPStatus(proxyErr.HTTPCode)
+	// A retryable failure was already reported through OnAttempt as each attempt
+	// ended; only a non-retryable one still needs reporting. Recording both
+	// would count the same node twice at full weight, and that feeds the
+	// breaker — enough of it would evict a node for one failed request.
+	if !result.LastVerdict.retryable && len(result.FailedNodes) > 0 {
+		stage := node.PassiveStageConnect
+		if result.Abandoned {
+			// Ran out of budget, which usually means a slow origin rather than
+			// an unreachable node, so it is the weaker signal.
+			stage = node.PassiveStageTransfer
+		}
+		last := result.FailedNodes[len(result.FailedNodes)-1]
+		recordPassiveStageResultAsync(p.health, routing.RouteResult{NodeHash: last}, stage, false)
+	}
+	writeProxyError(w, proxyErr)
+}
+
+func wrapForwardBody(body io.ReadCloser) *countingReadCloser {
+	if body == nil || body == http.NoBody {
+		return nil
+	}
+	return newCountingReadCloser(body)
+}
+
+func (p *ForwardProxy) writeForwardUpstreamResponse(
+	w http.ResponseWriter,
+	r *http.Request,
+	lifecycle *requestLifecycle,
+	resp *http.Response,
+	route routing.RouteResult,
+	hasRoute bool,
+) {
 	lifecycle.setHTTPStatus(resp.StatusCode)
 	lifecycle.setNetOK(true)
 
@@ -438,13 +578,7 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 
 	prepare := prepareConnectTunnel(
 		r.Context(),
-		tunnelDeps{
-			router:      p.router,
-			pool:        p.pool,
-			health:      p.health,
-			metricsSink: p.metricsSink,
-			bypass:      p.bypass,
-		},
+		p.tunnelDeps(),
 		platName,
 		account,
 		target,
@@ -530,4 +664,19 @@ func shouldRecordForwardCopyFailure(r *http.Request, copyErr error) bool {
 		return false
 	}
 	return classifyUpstreamError(copyErr) != nil
+}
+
+// tunnelDeps builds the dependencies for CONNECT tunnelling, including the dial
+// timeout and failover settings that keep a non-responsive node from parking the
+// connection.
+func (p *ForwardProxy) tunnelDeps() tunnelDeps {
+	return tunnelDeps{
+		router:      p.router,
+		pool:        p.pool,
+		health:      p.health,
+		metricsSink: p.metricsSink,
+		bypass:      p.bypass,
+		dialTimeout: dialTimeoutFor(p.transportConfig),
+		failover:    p.failover,
+	}
 }

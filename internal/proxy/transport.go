@@ -44,9 +44,9 @@ const (
 	// minutes, far too late to matter here. Setting IdleConnTimeout above the
 	// upstream's own cutoff is what produces "it connects, then breaks
 	// immediately".
-	defaultTransportIdleConnTimeout       = 45 * time.Second
-	defaultTransportDialTimeout           = 10 * time.Second
-	defaultTransportTLSHandshakeTimeout   = 10 * time.Second
+	defaultTransportIdleConnTimeout     = 45 * time.Second
+	defaultTransportDialTimeout         = 10 * time.Second
+	defaultTransportTLSHandshakeTimeout = 10 * time.Second
 	// Generous because a false 502 breaks working traffic: this bounds the wait
 	// for response headers only, so SSE and large downloads are unaffected, but
 	// long-polling and slow-first-byte APIs would be. Matches the default in
@@ -141,9 +141,23 @@ func (p *OutboundTransportPool) CloseAll() {
 func (p *OutboundTransportPool) newReusableOutboundTransport(ob adapter.Outbound, sink MetricsEventSink) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Report the dial to any failover attempt in progress, so it can tell
+			// "never connected" apart from "connected and then broke".
+			st := attemptStateFrom(ctx)
+			if st != nil {
+				st.dialAttempted.Store(true)
+			}
+
 			conn, err := p.dialOutbound(ctx, ob, network, addr)
 			if err != nil {
 				return nil, err
+			}
+			if st != nil {
+				st.dialSucceeded.Store(true)
+				// Wrapping here rather than deeper: bytes written can only be
+				// attributed to one attempt on a connection this attempt dialed,
+				// because a pooled one carries earlier requests' bytes too.
+				conn = &dialObserverConn{Conn: conn, st: st}
 			}
 			if sink != nil {
 				sink.OnConnectionLifecycle(ConnectionOutbound, ConnectionOpen)
@@ -270,4 +284,12 @@ func newDirectHTTPTransport(cfg OutboundTransportConfig, sink MetricsEventSink) 
 		TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
 		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
 	}
+}
+
+// dialTimeoutFor returns the configured outbound dial timeout. Used for CONNECT
+// tunnels, which dial the outbound directly and therefore do not inherit the
+// http.Transport's dial timeout.
+func dialTimeoutFor(cfg OutboundTransportConfig) time.Duration {
+	normalized := normalizeOutboundTransportConfig(cfg)
+	return normalized.DialTimeout
 }

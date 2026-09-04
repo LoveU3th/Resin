@@ -49,6 +49,10 @@ type Socks5InboundConfig struct {
 	// StickyAccountSource derives the sticky account from the request target
 	// when the client supplies no account. See platform.NormalizeForwardStickyAccount.
 	StickyAccountSource string
+	OutboundTransport   OutboundTransportConfig
+	// Failover controls request-level retries on other nodes. Zero means no
+	// retries.
+	Failover FailoverConfig
 }
 
 // Socks5Inbound implements SOCKS5 CONNECT over a raw TCP connection.
@@ -88,14 +92,22 @@ func NewSocks5Inbound(cfg Socks5InboundConfig) *Socks5Inbound {
 			health:      cfg.Health,
 			metricsSink: cfg.MetricsSink,
 			bypass:      NewTargetBypassMatcher(cfg.ProxyBypassRules),
+			dialTimeout: dialTimeoutFor(cfg.OutboundTransport),
+			failover:    cfg.Failover,
 		},
 		events: ev,
 	}
 }
 
 // ServeConn handles a SOCKS5 session on an already-accepted TCP connection.
+//
+// The context is cancellable rather than context.Background(): it becomes the
+// base context for tunnel dials, and cancelling it on return is what releases
+// the dial timer and the connection's cancel func.
 func (s *Socks5Inbound) ServeConn(conn net.Conn) {
-	s.ServeConnContext(context.Background(), conn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.ServeConnContext(ctx, conn)
 }
 
 // ServeConnContext handles a SOCKS5 session with a caller-provided base context.

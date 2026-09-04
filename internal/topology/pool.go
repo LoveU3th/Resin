@@ -652,6 +652,27 @@ func (p *GlobalNodePool) recordHealth(entry *node.NodeEntry, success bool, weigh
 	entry.RecordHealthSample(success, weight, p.currentHealthEwmaWindow(), p.currentHealthEwmaMinSamples())
 }
 
+// RecordConnDrop records that a pooled connection to this node turned out to be
+// dead: the peer had dropped it without telling us, which is the "it connects,
+// then breaks" symptom.
+//
+// It feeds the health score but deliberately not the breaker. A batch of idle
+// connections expiring together produces a burst of these, and counting them as
+// failures would evict a node that is probably fine only because our pool held
+// on to its connections longer than the peer did.
+//
+// platformID is accepted for interface symmetry with the other recorders and is
+// not used: the drop is about the node, not about who was using it.
+func (p *GlobalNodePool) RecordConnDrop(_ string, hash node.Hash) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+	// Same reduced weight as a transfer failure: the node was reached before,
+	// so this is weaker evidence than never reaching it at all.
+	p.recordHealth(entry, false, p.currentTransferFailureWeight())
+}
+
 // RecordPassiveStageResult records traffic feedback for one phase of a request.
 //
 // The breaker always sees the raw result — a failure is a failure regardless of

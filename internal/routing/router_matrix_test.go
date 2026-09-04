@@ -145,6 +145,7 @@ func TestRandomRoute_SingleNodeTrustsViewWithoutPoolValidation(t *testing.T) {
 		[]string{"cloudflare.com"},
 		10*time.Minute,
 		HealthWeights{},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("randomRoute failed: %v", err)
@@ -238,6 +239,7 @@ func TestChooseSameIPRotationCandidate_PicksLowestLatency(t *testing.T) {
 		"example.com",
 		[]string{"cloudflare.com"},
 		10*time.Minute,
+		nil,
 	)
 	if !ok {
 		t.Fatal("expected same-ip rotation candidate")

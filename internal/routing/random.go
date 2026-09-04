@@ -65,6 +65,10 @@ var randomRouteRNGPool = sync.Pool{
 // does not do extra pool scans/availability validation on the hot path.
 // Post-pick race handling (node removed right after selection) is handled by
 // the caller in RouteRequest.
+// excludePickAttempts bounds how many candidates are drawn when avoiding nodes
+// this request has already failed on.
+const excludePickAttempts = 8
+
 func randomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
@@ -73,6 +77,7 @@ func randomRoute(
 	authorities []string,
 	p2cWindow time.Duration,
 	health HealthWeights,
+	exclude []node.Hash,
 ) (node.Hash, error) {
 	view := plat.View()
 	size := view.Size()
@@ -80,11 +85,47 @@ func randomRoute(
 		return node.Zero, ErrNoAvailableNodes
 	}
 
+	isExcluded := func(h node.Hash) bool {
+		for _, e := range exclude {
+			if e == h {
+				return true
+			}
+		}
+		return false
+	}
+
 	rng := randomRouteRNGPool.Get().(*rand.Rand)
 	defer randomRouteRNGPool.Put(rng)
 
+	// Skip nodes this request already failed on. Random draws are used first to
+	// keep the choice unbiased; if they keep landing on excluded nodes the scan
+	// below guarantees routing still succeeds. Without it, a view where most
+	// nodes are excluded could fail a request that does have a usable node.
 	pick := func() (node.Hash, bool) {
-		return view.RandomPick(rng)
+		for i := 0; i < excludePickAttempts; i++ {
+			h, ok := view.RandomPick(rng)
+			if !ok {
+				return node.Zero, false
+			}
+			if !isExcluded(h) {
+				return h, true
+			}
+		}
+
+		var fallback node.Hash
+		found := false
+		view.Range(func(h node.Hash) bool {
+			if isExcluded(h) {
+				return true
+			}
+			fallback = h
+			found = true
+			return false
+		})
+		if !found {
+			return node.Zero, false
+		}
+		return fallback, true
 	}
 
 	// Health filtering is best-effort: if no healthy candidate turns up, the

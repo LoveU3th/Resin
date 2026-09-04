@@ -54,6 +54,16 @@ type RuntimeConfig struct {
 	// The node was reached in that case, so the fault may not be its own.
 	// 100 weights both the same; 0 ignores transfer failures.
 	HealthTransferFailureWeightPercent int `json:"health_transfer_failure_weight_percent"`
+	// Request-level failover: retry a request on another node when the request
+	// provably never reached the first one. Never retried once any byte of the
+	// request has been written, so non-idempotent requests cannot be duplicated.
+	// FailoverMaxAttempts counts the first attempt, so 1 disables retrying.
+	FailoverEnabled     bool `json:"failover_enabled"`
+	FailoverMaxAttempts int  `json:"failover_max_attempts"`
+	// FailoverAttemptBudget bounds one attempt; reaching it abandons that
+	// attempt and moves to the next node. FailoverTotalBudget bounds them all.
+	FailoverAttemptBudget Duration `json:"failover_attempt_budget"`
+	FailoverTotalBudget   Duration `json:"failover_total_budget"`
 
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
@@ -90,9 +100,15 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		CircuitMaxCooldown:                 Duration(30 * time.Minute),
 		HealthRecoveryFloorPercent:         60,
 		HealthTransferFailureWeightPercent: 50,
-		MaxLatencyTestInterval:             Duration(1 * time.Hour),
-		MaxAuthorityLatencyTestInterval:    Duration(3 * time.Hour),
-		MaxEgressTestInterval:              Duration(24 * time.Hour),
+		FailoverEnabled:                    true,
+		FailoverMaxAttempts:                2,
+		// The attempt budget must not be shorter than ResponseHeaderTimeout, or
+		// a slow-but-healthy origin would be abandoned before it could answer.
+		FailoverAttemptBudget:           Duration(60 * time.Second),
+		FailoverTotalBudget:             Duration(90 * time.Second),
+		MaxLatencyTestInterval:          Duration(1 * time.Hour),
+		MaxAuthorityLatencyTestInterval: Duration(3 * time.Hour),
+		MaxEgressTestInterval:           Duration(24 * time.Hour),
 
 		LatencyTestURL:     "https://www.gstatic.com/generate_204",
 		LatencyAuthorities: []string{"gstatic.com", "google.com", "cloudflare.com", "github.com"},

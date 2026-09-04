@@ -94,6 +94,18 @@ type RouteResult struct {
 	EgressIP     netip.Addr
 	NodeTag      string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
 	LeaseCreated bool
+	// Borrowed means the node was handed out for this request only, without
+	// touching the caller's lease. Used when a request has to avoid its sticky
+	// node: skipping the lease write keeps the egress IP stable across the
+	// requests that do not fail.
+	Borrowed bool
+}
+
+// RouteOptions carries per-request routing constraints.
+type RouteOptions struct {
+	// Exclude lists nodes this request must not use, because it already failed
+	// on them. Empty for ordinary requests.
+	Exclude []node.Hash
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -107,6 +119,15 @@ const (
 )
 
 func (r *Router) RouteRequest(platName, account, target string) (RouteResult, error) {
+	return r.RouteRequestExcluding(platName, account, target, RouteOptions{})
+}
+
+// RouteRequestExcluding behaves like RouteRequest but avoids the given nodes.
+// Callers use it when retrying a request on a different node.
+func (r *Router) RouteRequestExcluding(
+	platName, account, target string,
+	opt RouteOptions,
+) (RouteResult, error) {
 	plat, err := r.resolvePlatform(platName)
 	if err != nil {
 		return RouteResult{}, err
@@ -116,9 +137,9 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 	state := r.ensurePlatformState(plat.ID)
 	var result RouteResult
 	if account == "" {
-		result, err = r.routeRandom(plat, state, targetDomain)
+		result, err = r.routeRandom(plat, state, targetDomain, opt)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now())
+		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now(), opt)
 	}
 	if err != nil {
 		return RouteResult{}, err
@@ -161,8 +182,9 @@ func (r *Router) routeRandom(
 	plat *platform.Platform,
 	state *PlatformRoutingState,
 	targetDomain string,
+	opt RouteOptions,
 ) (RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, opt.Exclude)
 	if err != nil {
 		return RouteResult{}, err
 	}
@@ -179,6 +201,7 @@ func (r *Router) routeSticky(
 	account string,
 	targetDomain string,
 	now time.Time,
+	opt RouteOptions,
 ) (RouteResult, error) {
 	nowNs := now.UnixNano()
 	var result RouteResult
@@ -194,6 +217,7 @@ func (r *Router) routeSticky(
 			nowNs,
 			current,
 			loaded,
+			opt.Exclude,
 		)
 		if err != nil {
 			routeErr = err
@@ -215,6 +239,7 @@ func (r *Router) decideStickyLease(
 	nowNs int64,
 	current Lease,
 	loaded bool,
+	exclude []node.Hash,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -225,10 +250,17 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
-			return newLease, xsync.UpdateOp, hitResult, nil
+		if !containsHash(exclude, current.NodeHash) {
+			if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
+				return newLease, xsync.UpdateOp, hitResult, nil
+			}
+		} else if borrowed, ok := r.borrowRoute(plat, state, current, targetDomain, nowNs, exclude); ok {
+			// The sticky node is unusable for this request only. Hand out another
+			// node without touching the lease (CancelOp), so a single failure
+			// does not relocate the account's egress IP.
+			return current, xsync.CancelOp, borrowed, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs, exclude); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -244,6 +276,7 @@ func (r *Router) decideStickyLease(
 		current,
 		hadPreviousLease,
 		invalidation,
+		exclude,
 	)
 }
 
@@ -257,9 +290,18 @@ func (r *Router) createOrAbortStickyLease(
 	previous Lease,
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
+	exclude []node.Hash,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
-	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs)
+	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, exclude)
 	if err != nil {
+		// "No other node" is a property of this request's exclude list, not of
+		// the account's lease. Keep the lease (CancelOp) so one failed attempt
+		// cannot relocate the account's egress IP — a single-node platform
+		// would otherwise lose its lease on the first retry and scatter
+		// subsequent requests across new addresses.
+		if len(exclude) > 0 && errors.Is(err, ErrNoAvailableNodes) {
+			return previous, xsync.CancelOp, RouteResult{}, err
+		}
 		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
 		return lease, op, RouteResult{}, err
@@ -310,6 +352,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	current Lease,
 	targetDomain string,
 	nowNs int64,
+	exclude []node.Hash,
 ) (Lease, RouteResult, bool) {
 	bestHash, ok := chooseSameIPRotationCandidate(
 		plat,
@@ -318,6 +361,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		targetDomain,
 		r.authorities(),
 		r.p2cWindow(),
+		exclude,
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -346,8 +390,9 @@ func (r *Router) createLease(
 	targetDomain string,
 	now time.Time,
 	nowNs int64,
+	exclude []node.Hash,
 ) (Lease, RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, exclude)
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
@@ -421,10 +466,11 @@ func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
 	targetDomain string,
+	exclude []node.Hash,
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
-		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), r.healthWeights())
+		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), r.healthWeights(), exclude)
 		if err != nil {
 			return node.Zero, nil, err
 		}
@@ -447,6 +493,7 @@ func chooseSameIPRotationCandidate(
 	targetDomain string,
 	authorities []string,
 	window time.Duration,
+	exclude []node.Hash,
 ) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
@@ -454,7 +501,7 @@ func chooseSameIPRotationCandidate(
 
 	plat.View().Range(func(h node.Hash) bool {
 		entry, ok := pool.GetEntry(h)
-		if !ok || entry.GetEgressIP() != targetIP {
+		if !ok || entry.GetEgressIP() != targetIP || containsHash(exclude, h) {
 			return true
 		}
 		if fallbackHash == node.Zero {
@@ -661,4 +708,62 @@ func (r *Router) DeleteAllLeases(platformID string) int {
 		return true
 	})
 	return count
+}
+
+func containsHash(haystack []node.Hash, needle node.Hash) bool {
+	for _, h := range haystack {
+		if h == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// borrowRoute hands out a node for this request only, leaving the caller's
+// lease exactly as it was.
+//
+// It is used when a request cannot use its sticky node because it just failed
+// there. Not writing the lease matters: updating it would relocate the account
+// on the strength of one failure, and a flapping node could then drag the
+// account across egress IPs. A borrowed node also skips IPLoadStats, so it is
+// invisible to load balancing — acceptable, because it also means a retry does
+// not make the borrowed IP look busier than it is.
+//
+// Preference is given to another node behind the same egress IP, so the account
+// keeps its address wherever that is possible.
+func (r *Router) borrowRoute(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	current Lease,
+	targetDomain string,
+	nowNs int64,
+	exclude []node.Hash,
+) (RouteResult, bool) {
+	if h, ok := chooseSameIPRotationCandidate(
+		plat,
+		r.pool,
+		current.EgressIP,
+		targetDomain,
+		r.authorities(),
+		r.p2cWindow(),
+		exclude,
+	); ok {
+		if entry, found := r.pool.GetEntry(h); found {
+			return RouteResult{
+				NodeHash: h,
+				EgressIP: entry.GetEgressIP(),
+				Borrowed: true,
+			}, true
+		}
+	}
+
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, exclude)
+	if err != nil {
+		return RouteResult{}, false
+	}
+	return RouteResult{
+		NodeHash: h,
+		EgressIP: entry.GetEgressIP(),
+		Borrowed: true,
+	}, true
 }

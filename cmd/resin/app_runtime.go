@@ -448,6 +448,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		TransportPool:       a.transportPool,
 		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
 		StickyAccountSource: string(a.envCfg.ForwardStickyAccount),
+		Failover:            a.failoverConfig(),
 	})
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
@@ -463,6 +464,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		OutboundTransport: outboundTransportCfg,
 		TransportPool:     a.transportPool,
 		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		Failover:          a.failoverConfig(),
 	})
 	socks5Inbound := proxy.NewSocks5Inbound(proxy.Socks5InboundConfig{
 		ProxyToken:          a.envCfg.ProxyToken,
@@ -474,6 +476,8 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		MetricsSink:         a.metricsManager,
 		ProxyBypassRules:    a.envCfg.ProxyBypassRules,
 		StickyAccountSource: string(a.envCfg.ForwardStickyAccount),
+		OutboundTransport:   outboundTransportCfg,
+		Failover:            a.failoverConfig(),
 	})
 
 	inboundHandler := newInboundMux(
@@ -619,4 +623,16 @@ func (a *resinApp) shutdown(ctx context.Context) {
 
 	a.flushWorker.Stop() // final cache flush before DB close
 	log.Println("Server stopped")
+}
+
+// failoverConfig reads the current request-level failover settings.
+// FailoverMaxAttempts counts the first attempt, so 1 means no retry.
+func (a *resinApp) failoverConfig() proxy.FailoverConfig {
+	cfg := runtimeConfigSnapshot(a.runtimeCfg)
+	return proxy.FailoverConfig{
+		Enabled:       cfg.FailoverEnabled,
+		MaxAttempts:   cfg.FailoverMaxAttempts,
+		AttemptBudget: time.Duration(cfg.FailoverAttemptBudget),
+		TotalBudget:   time.Duration(cfg.FailoverTotalBudget),
+	}
 }

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptrace"
@@ -38,7 +39,10 @@ type ReverseProxyConfig struct {
 	MetricsSink       MetricsEventSink
 	OutboundTransport OutboundTransportConfig
 	TransportPool     *OutboundTransportPool
-	ProxyBypassRules  []string
+	// Failover controls request-level retries on other nodes. Left zero-valued
+	// it means no retries, preserving the previous behaviour.
+	Failover         FailoverConfig
+	ProxyBypassRules []string
 }
 
 // ReverseProxy implements an HTTP reverse proxy.
@@ -61,6 +65,7 @@ type ReverseProxy struct {
 	directTransport   *http.Transport
 	directOnce        sync.Once
 	bypass            *TargetBypassMatcher
+	failover          FailoverConfig
 }
 
 // NewReverseProxy creates a new reverse proxy handler.
@@ -91,6 +96,7 @@ func NewReverseProxy(cfg ReverseProxyConfig) *ReverseProxy {
 		transportConfig: transportCfg,
 		transportPool:   transportPool,
 		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		failover:        cfg.Failover,
 	}
 }
 
@@ -415,31 +421,51 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routing.RouteResult
 	var hasRoute bool
 	var transport *http.Transport
-	var nodeHashRaw = route.NodeHash
 	domain := netutil.ExtractDomain(parsed.Host)
 	// A response with a body is only counted as served once the body has been
 	// transferred in full. Set when the body is wrapped, so the success can be
 	// recorded after ServeHTTP returns instead of when headers arrive.
 	var transferResultPending atomic.Bool
 	var transferFailed atomic.Bool
+	// Set when the request went through the node pool rather than a bypass, so
+	// the outcome can be attributed to the node that actually served it.
+	var failoverRT *reverseFailoverTransport
+
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
 	} else {
-		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, parsed.PlatformName, account, parsed.Host)
-		if routeErr != nil {
-			lifecycle.setProxyError(routeErr)
-			lifecycle.setHTTPStatus(routeErr.HTTPCode)
-			writeProxyError(w, routeErr)
-			return
+		failoverRT = &reverseFailoverTransport{
+			cfg: p.failover,
+			resolve: func(exclude []node.Hash) (routedOutbound, *ProxyError) {
+				return resolveRoutedOutboundExcluding(
+					p.router, p.pool, parsed.PlatformName, account, parsed.Host, exclude)
+			},
+			transport: p.outboundHTTPTransport,
+			tlsTrace: func(routed routedOutbound) *httptrace.ClientTrace {
+				if parsed.Protocol != "https" || p.health == nil {
+					return nil
+				}
+				return newReverseLatencyReporter(p.health, routed.Route.NodeHash, domain).clientTrace()
+			},
+			onRun: func(routed routedOutbound) {
+				if p.health != nil {
+					go p.health.RecordPassiveLatency(routed.Route.NodeHash, domain, nil)
+				}
+			},
+			onAttempt: func(res routing.RouteResult, verdict attemptVerdict) {
+				if p.health == nil {
+					return
+				}
+				if verdict.retryable {
+					recordPassiveStageResultAsync(p.health, res, node.PassiveStageConnect, false)
+					return
+				}
+				if verdict.deadConn {
+					recordConnDropAsync(p.health, res)
+				}
+			},
 		}
-		route = routed.Route
-		hasRoute = true
-		nodeHashRaw = route.NodeHash
-		lifecycle.setRouteResult(route)
-		if p.health != nil {
-			go p.health.RecordPassiveLatency(nodeHashRaw, domain, nil)
-		}
-		transport = p.outboundHTTPTransport(routed)
+		transport = nil // chosen per attempt by failoverRT
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -453,16 +479,16 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// observe whether the upstream request was actually written.
 			reqCtx := httptrace.WithClientTrace(req.Context(), upstreamTrace.clientTrace())
 
-			// Add httptrace for TLS latency measurement on HTTPS.
-			if parsed.Protocol == "https" && hasRoute && p.health != nil {
-				reporter := newReverseLatencyReporter(p.health, nodeHashRaw, domain)
-				reqCtx = httptrace.WithClientTrace(reqCtx, reporter.clientTrace())
-			}
 			*req = *req.WithContext(reqCtx)
 		},
-		Transport: transport,
+		Transport: reverseProxyTransport(transport, failoverRT),
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
 			proxyErr := classifyUpstreamError(err)
+			// A retry that ran out of nodes is a routing failure and keeps its
+			// own status code, rather than being reported as a bad gateway.
+			if errors.Is(err, errNoRouteForAttempt) {
+				proxyErr = ErrNoAvailableNodes
+			}
 			if proxyErr == nil {
 				// context.Canceled — no health recording, silently close.
 				// Treat as net-ok for request-log semantics when canceled
@@ -474,8 +500,18 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setUpstreamError("reverse_roundtrip", err)
 			lifecycle.setNetOK(false)
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
-			if hasRoute {
-				recordPassiveResultAsync(p.health, route, false)
+			// A retryable failure was already reported by OnAttempt as each attempt
+			// ended; only a non-retryable one still needs reporting here, or the
+			// last node would be counted twice at full weight and pushed toward
+			// eviction for a single failed request.
+			if rt, ok := reverseFailedRoute(failoverRT); ok && !lastVerdict(failoverRT).retryable {
+				stage := node.PassiveStageConnect
+				if failoverRT != nil && failoverRT.result != nil && failoverRT.result.Abandoned {
+					// Ran out of budget: a slow origin is a weaker signal than an
+					// unreachable node.
+					stage = node.PassiveStageTransfer
+				}
+				recordPassiveStageResultAsync(p.health, rt, stage, false)
 			}
 			writeProxyError(rw, proxyErr)
 		},
@@ -499,8 +535,8 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					lifecycle.setRespHeadersCaptured(respHeaders, respHeadersLen, respHeadersTruncated)
 				}
 				lifecycle.setNetOK(true)
-				if hasRoute {
-					recordPassiveResultAsync(p.health, route, true)
+				if rt, ok := failoverRT.currentRoute(); ok {
+					recordPassiveResultAsync(p.health, rt, true)
 				}
 				return nil
 			}
@@ -527,11 +563,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					transferFailed.Store(true)
 					lifecycle.setNetOK(false)
 					lifecycle.setUpstreamError("reverse_upstream_to_client_copy", err)
-					if hasRoute {
+					if rt, ok := failoverRT.currentRoute(); ok {
 						// Transfer phase: the node was reached and had started
 						// responding, so this weighs less against it than a
 						// failure to reach it at all.
-						recordPassiveStageResultAsync(p.health, route, node.PassiveStageTransfer, false)
+						recordPassiveStageResultAsync(p.health, rt, node.PassiveStageTransfer, false)
 					}
 				})
 				resp.Body = ingressBodyCounter
@@ -544,8 +580,8 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !transferResultPending.Load() {
 				// No body to transfer, so nothing can fail after this point.
 				lifecycle.setNetOK(true)
-				if hasRoute {
-					recordPassiveResultAsync(p.health, route, true)
+				if rt, ok := failoverRT.currentRoute(); ok {
+					recordPassiveResultAsync(p.health, rt, true)
 				}
 			}
 			return nil
@@ -553,6 +589,16 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy.ServeHTTP(w, r)
+
+	// Attribute the request to the node that actually served it. With failover
+	// the node is only known afterwards, and the traffic-path latency samples
+	// above are already recorded per attempt.
+	if failoverRT != nil && failoverRT.result != nil && failoverRT.result.Value != nil {
+		route = failoverRT.result.Route
+		hasRoute = true
+		lifecycle.setRouteResult(route)
+	}
+
 	if upstreamTrace.shouldCommitEgress() {
 		lifecycle.addEgressBytes(pendingEgressHeaderBytes)
 		if egressBodyCounter != nil {
@@ -734,4 +780,38 @@ func isValidHost(host string) bool {
 		return false
 	}
 	return true
+}
+
+// reverseProxyTransport picks the transport for the reverse proxy: the failover
+// transport when the request goes through the node pool, the pre-resolved one
+// otherwise.
+func reverseProxyTransport(direct *http.Transport, failover *reverseFailoverTransport) http.RoundTripper {
+	if failover != nil {
+		return failover
+	}
+	return direct
+}
+
+// reverseFailedRoute reports the node a reverse-proxy failure belongs to.
+// The last attempted node is used when the transport recorded them; retryable
+// attempts are already reported through OnAttempt, so only the final failure
+// reaches here.
+func reverseFailedRoute(rt *reverseFailoverTransport) (routing.RouteResult, bool) {
+	if rt == nil || rt.result == nil {
+		return routing.RouteResult{}, false
+	}
+	if len(rt.result.FailedNodes) == 0 {
+		return routing.RouteResult{}, false
+	}
+	last := rt.result.FailedNodes[len(rt.result.FailedNodes)-1]
+	return routing.RouteResult{NodeHash: last}, true
+}
+
+// lastVerdict reports how the reverse proxy's final attempt was classified, so
+// the caller can avoid recording a failure that OnAttempt already reported.
+func lastVerdict(rt *reverseFailoverTransport) attemptVerdict {
+	if rt == nil || rt.result == nil {
+		return attemptVerdict{}
+	}
+	return rt.result.LastVerdict
 }
