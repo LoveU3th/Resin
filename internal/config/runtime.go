@@ -137,6 +137,39 @@ func ApplyCompatibilityDefaults(cfg *RuntimeConfig, envCfg *EnvConfig) (*Runtime
 		changed = true
 	}
 
+	// Everything below was introduced after this config was first persisted, so
+	// an upgraded config lacks the fields and reads them back as zero. Some of
+	// those zeros silently switch the new behaviour off — worst of all for a
+	// boolean, where "missing" and "explicitly disabled" look alike.
+	//
+	// Only fields whose zero value *disables* the feature are backfilled. Fields
+	// where zero is a meaningful setting (CircuitCooldown = 0 disables cooling,
+	// HealthPenaltyMs = 0 disables the latency penalty) are left alone: once an
+	// operator sets them to zero on purpose, overwriting that on every restart
+	// would be its own bug.
+	if out.MaxConsecutiveFailures <= 0 {
+		// Zero means the breaker never fires: the check is `> 0 &&`.
+		out.MaxConsecutiveFailures = 3
+		changed = true
+	}
+	if out.HealthMinSamplesForFilter <= 0 {
+		// Zero would report a success rate with no observations behind it.
+		out.HealthMinSamplesForFilter = 8
+		changed = true
+	}
+
+	// Failover is keyed off MaxAttempts rather than Enabled: Enabled is a bool,
+	// so a config that predates the feature and one that deliberately disables
+	// it are indistinguishable. MaxAttempts is validated to be at least 1, so a
+	// zero can only mean "never configured".
+	if out.FailoverMaxAttempts <= 0 {
+		out.FailoverEnabled = true
+		out.FailoverMaxAttempts = 2
+		out.FailoverAttemptBudget = Duration(60 * time.Second)
+		out.FailoverTotalBudget = Duration(90 * time.Second)
+		changed = true
+	}
+
 	return &out, changed
 }
 
