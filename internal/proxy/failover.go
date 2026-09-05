@@ -327,6 +327,32 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 	}
 }
 
+// maxLingeringAttempts bounds how many abandoned attempts may be in flight at
+// once across the whole process.
+//
+// A node that goes slow abandons every request sent its way. Those attempts keep
+// occupying a goroutine and a socket until the upstream gives up, so if requests
+// arrive faster than they are released the count grows. Left unbounded, one slow
+// node during a traffic spike can exhaust file descriptors, and retrying on top
+// of that pushes extra load onto the nodes still working — the classic way a
+// single bad node becomes an outage. Past this point requests fail fast instead
+// of adding to the pile.
+const maxLingeringAttempts = 512
+
+// lingeringAttempts tracks abandoned attempts that have not been released yet.
+var lingeringAttempts = make(chan struct{}, maxLingeringAttempts)
+
+// errAttemptOverloaded reports a budget expiry that could not be abandoned
+// because too many attempts are already lingering. It is reported as a timeout:
+// from the client's point of view this is the same as an origin that never
+// answered, and unlike a bare failure it does not blame the node.
+var errAttemptOverloaded = overloadedError{}
+
+type overloadedError struct{}
+
+func (overloadedError) Error() string { return "attempt budget expired under load" }
+func (overloadedError) Timeout() bool { return true }
+
 // attemptResult carries one attempt's outcome to whoever is waiting for it.
 type attemptResult[T any] struct {
 	value T
@@ -369,11 +395,16 @@ func (p FailoverParams[T]) runAttempt(
 	case res := <-done:
 		return res.value, res.err
 	case <-timer.C:
-		// Abandoned: the result will be dropped, so it is safe to stop waiting
-		// on the upstream. Then release whatever the attempt produces on its way
-		// down — otherwise the response body (or a tunneled socket) is never
-		// closed.
-		p.releaseOnArrival(done)
+		// Abandoning costs a lingering goroutine and socket until the upstream
+		// gives up, so it needs a slot. Without one, fail fast rather than
+		// abandoning: shedding this request is safer than piling up, and retrying
+		// here would push more traffic onto the nodes still working.
+		select {
+		case lingeringAttempts <- struct{}{}:
+			p.releaseOnArrival(done, func() { <-lingeringAttempts })
+		default:
+			return zero, errAttemptOverloaded
+		}
 		return zero, errAttemptAbandoned
 	case <-ctx.Done():
 		// The client went away, but the attempt may still finish and produce
@@ -381,19 +412,24 @@ func (p FailoverParams[T]) runAttempt(
 		// cancellation, yet a tunneled socket does not: dialTunnelConn returns a
 		// connection whose context is only cancelled when it is closed, so
 		// dropping it here would leave an fd and a child context behind.
-		p.releaseOnArrival(done)
+		p.releaseOnArrival(done, nil)
 		return zero, ctx.Err()
 	}
 }
 
 // releaseOnArrival waits for an attempt that is no longer being waited on and
 // releases whatever it eventually produces.
-func (p FailoverParams[T]) releaseOnArrival(done chan attemptResult[T]) {
-	if p.Cleanup == nil {
-		return
-	}
+// releaseOnArrival waits for an attempt nobody is waiting for any more and
+// releases whatever it eventually produces. onReleased runs afterwards, so a
+// caller can give back whatever the abandonment reserved.
+func (p FailoverParams[T]) releaseOnArrival(done chan attemptResult[T], onReleased func()) {
 	go func() {
-		if res := <-done; res.err == nil {
+		defer func() {
+			if onReleased != nil {
+				onReleased()
+			}
+		}()
+		if res := <-done; res.err == nil && p.Cleanup != nil {
 			p.Cleanup(res.value)
 		}
 	}()
