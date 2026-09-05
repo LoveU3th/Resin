@@ -342,6 +342,21 @@ RESIN_PORT=2260 \
 
 ---
 
+## 🔧 链路稳定性调优（环境变量）
+
+以下变量用于调节出站超时、指标保留与请求级 failover 的行为。**均有默认值，不设置即可正常运行**。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT` | `10s` | TCP 建连超时。仅约束连接建立，不含 TLS 握手与首字节，因此应显著小于整体探测预算（主动探测全程 15s），否则无法区分「慢」与「死」。必须为正。 |
+| `RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT` | `10s` | TLS 握手超时。必须为正。 |
+| `RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT` | `60s` | 等待上游响应头的超时。仅约束响应头，不影响 body 传输，因此 SSE 与大文件下载不受影响。设为 `0` 表示禁用该限制，但会**连带自动关闭请求级 failover**。 |
+| `RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD` | `30s` | TCP keep-alive 探测周期。必须为正。 |
+| `RESIN_METRIC_RETENTION_DAYS` | `30` | 落盘指标的保留天数，按 bucket 边界整桶清理。设为 `0` 表示永不清理。 |
+
+> **升级注意**：`RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT` 的默认值由 `90s` 调整为 `45s`，
+> 以便更快回收空闲连接。若你依赖原行为，请显式设置该变量。
+
 ## 🛠️ 常见错误 (FAQ)
 
 - **Q: 如何让内网或本机目标不走代理节点？**

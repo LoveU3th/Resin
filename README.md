@@ -356,6 +356,23 @@ RESIN_PORT=2260 \
 
 ---
 
+## 🔧 Stability Tuning (Environment Variables)
+
+These control outbound timeouts, metric retention, and request-level failover.
+**All of them have defaults — leaving them unset is fine.**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RESIN_PROXY_TRANSPORT_DIAL_TIMEOUT` | `10s` | TCP connect timeout. Covers connection establishment only, not TLS or first byte, so it must stay well below the overall probe budget (proactive probing allows 15s end-to-end) or a slow hop becomes indistinguishable from a dead one. Must be positive. |
+| `RESIN_PROXY_TRANSPORT_TLS_HANDSHAKE_TIMEOUT` | `10s` | TLS handshake timeout. Must be positive. |
+| `RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT` | `60s` | How long to wait for upstream response headers. Headers only — body transfer is unaffected, so SSE and large downloads are safe. Set to `0` to disable the limit, which also **turns request-level failover off automatically**. |
+| `RESIN_PROXY_TRANSPORT_KEEP_ALIVE_PERIOD` | `30s` | TCP keep-alive probe interval. Must be positive. |
+| `RESIN_METRIC_RETENTION_DAYS` | `30` | How long persisted metric buckets are kept, pruned along bucket boundaries. Set to `0` to keep them forever. |
+
+> **Upgrade note:** the default for `RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT` changed
+> from `90s` to `45s` so idle connections are reclaimed sooner. Set it explicitly if
+> you rely on the previous behaviour.
+
 ## 🛠️ FAQ
 
 - **Q: How do I let LAN or localhost targets skip proxy nodes?**
