@@ -630,10 +630,24 @@ func (a *resinApp) shutdown(ctx context.Context) {
 // FailoverMaxAttempts counts the first attempt, so 1 means no retry.
 func (a *resinApp) failoverConfig() proxy.FailoverConfig {
 	cfg := runtimeConfigSnapshot(a.runtimeCfg)
+	attemptBudget := time.Duration(cfg.FailoverAttemptBudget)
+
+	// An abandoned attempt is released only once the upstream gives up on it.
+	// With no response-header timeout that never happens, so every abandoned
+	// attempt would park a goroutine and a socket forever — an unbounded leak in
+	// a long-running process. Refuse to arm failover in that configuration.
+	if attemptBudget > 0 && a.envCfg.ProxyTransportResponseHeaderTimeout <= 0 {
+		// Name the variable exactly as it is read from the environment, so an
+		// operator can find it.
+		log.Printf("[failover] disabled: RESIN_PROXY_TRANSPORT_RESPONSE_HEADER_TIMEOUT is 0, " +
+			"so an abandoned attempt would never be released; set it above 0 to enable failover")
+		attemptBudget = 0
+	}
+
 	return proxy.FailoverConfig{
 		Enabled:       cfg.FailoverEnabled,
 		MaxAttempts:   cfg.FailoverMaxAttempts,
-		AttemptBudget: time.Duration(cfg.FailoverAttemptBudget),
+		AttemptBudget: attemptBudget,
 		TotalBudget:   time.Duration(cfg.FailoverTotalBudget),
 	}
 }

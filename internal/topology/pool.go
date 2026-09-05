@@ -696,8 +696,11 @@ func (p *GlobalNodePool) RecordPassiveStageResult(
 		weight = p.currentTransferFailureWeight()
 	}
 
-	// The breaker is skipped entirely for platforms that opted out, matching
-	// RecordPassiveResult.
+	// Both phases feed the breaker: the breaker ejects nodes that cannot serve a
+	// request, and a node that resets connections mid-transfer is as broken as
+	// one that refuses them. Failures that only mean "the origin was slow" are
+	// reported through RecordPassiveSlowFailure instead, which skips the
+	// breaker.
 	if success || !p.passiveCircuitBreakerDisabled(platformID) {
 		dynamicChanged, circuitStateChanged := p.recordBreaker(entry, success)
 		if circuitStateChanged {
@@ -994,4 +997,21 @@ func (p *GlobalNodePool) isAuthorityDomain(domain string) bool {
 		}
 	}
 	return false
+}
+
+// RecordPassiveSlowFailure records a failure that means the origin was slow
+// rather than the node being broken.
+//
+// It lowers the health score but deliberately skips the breaker: a node that
+// answers slowly is still serving traffic, and evicting it would remove working
+// capacity. A node that is genuinely broken fails in other ways too — resets
+// and refused connections — and those do reach the breaker.
+//
+// platformID is accepted for interface symmetry and is not used.
+func (p *GlobalNodePool) RecordPassiveSlowFailure(_ string, hash node.Hash) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+	p.recordHealth(entry, false, p.currentTransferFailureWeight())
 }

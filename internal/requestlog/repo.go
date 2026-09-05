@@ -493,7 +493,12 @@ func (r *Repo) migrateRetainedDBs() {
 			continue
 		}
 		if err := ensureRequestLogSchema(db); err != nil {
-			log.Printf("[requestlog] warning: migrate db failed path=%q: %v", path, err)
+			// State the consequence, not just the failure: queries always ask for
+			// the full column list, so a file that failed to migrate will yield
+			// no rows rather than an error. Without this hint the logs just
+			// appear to vanish.
+			log.Printf("[requestlog] warning: migrate db failed path=%q: %v; "+
+				"logs in this file will not be queryable until it is migrated", path, err)
 		}
 		if err := db.Close(); err != nil {
 			log.Printf("[requestlog] warning: close migrated db failed path=%q: %v", path, err)

@@ -258,6 +258,19 @@ func (c *dialCancelConn) Close() error {
 // connection wrappers so callers can reach the underlying connection.
 func (c *dialCancelConn) Unwrap() net.Conn { return c.Conn }
 
+// CloseWrite half-closes the write side of the connection.
+//
+// Wrappers must forward this. Some protocols signal "request complete" by
+// shutting down only the write direction while still reading the response, and
+// without it the tunnel pump would fall back to closing both directions and
+// discard a response that had not arrived yet.
+func (c *dialCancelConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errHalfCloseUnsupported
+}
+
 func newDirectHTTPTransport(cfg OutboundTransportConfig, sink MetricsEventSink) *http.Transport {
 	cfg = normalizeOutboundTransportConfig(cfg)
 	dialer := &net.Dialer{

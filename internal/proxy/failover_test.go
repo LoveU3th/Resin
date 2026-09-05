@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -443,3 +444,42 @@ func TestRecordFailover_ClearsFirstHopOK(t *testing.T) {
 		t.Fatal("expected the failed node to be recorded")
 	}
 }
+
+// Every connection wrapper must stay transparent for half-close. A wrapper that
+// silently drops CloseWrite breaks tunneled protocols that shut down only their
+// write direction while still reading the response — the tunnel pump then closes
+// both directions and the response is lost.
+func TestConnectionWrappers_ForwardCloseWrite(t *testing.T) {
+	var cw interface{ CloseWrite() error }
+
+	cw = &dialCancelConn{Conn: &fakeTCPConn{}}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("dialCancelConn.CloseWrite should forward to the inner conn: %v", err)
+	}
+
+	cw = &dialObserverConn{Conn: &fakeTCPConn{}}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("dialObserverConn.CloseWrite should forward to the inner conn: %v", err)
+	}
+}
+
+// A connection that cannot half-close must report it, so callers can fall back
+// to closing both directions rather than assuming it worked.
+func TestConnectionWrappers_ReportUnsupportedHalfClose(t *testing.T) {
+	c := &dialCancelConn{Conn: &plainConn{}}
+	if err := c.CloseWrite(); !errors.Is(err, errHalfCloseUnsupported) {
+		t.Fatalf("got %v, want errHalfCloseUnsupported", err)
+	}
+}
+
+type fakeTCPConn struct {
+	net.Conn
+	writeClosed bool
+}
+
+func (c *fakeTCPConn) CloseWrite() error {
+	c.writeClosed = true
+	return nil
+}
+
+type plainConn struct{ net.Conn }

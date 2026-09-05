@@ -442,8 +442,17 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
     * **R1**：未能取得连接（拨号、TLS 握手、代理握手失败）。什么都没发出去，不可能重复提交。
     * **R2**：本次 attempt 自己新建了连接，且写出的字节为零。计数器在新连接上从零起算，因此零字节意味着请求没有发出。
     * 其余一律不重试，尤其包括：**等待响应头超时**（请求行与 header 已发出，服务端可能已经在处理）、**被放弃的 attempt**（无法确认是否已发出）、**复用连接**（计数器含此前请求的字节，无法归属本次）。
-* **预算采用「放弃式」而非 `context.WithTimeout`**：request 的 ctx 会被 `resp.Body` 继承，加 deadline 会砍掉流式响应与大文件下载。预算到期即放弃该 attempt 并换节点，被放弃的 attempt 在后台跑完后由 `Cleanup` 释放其响应体或 socket。
-* **attempt 预算不得短于 `ResponseHeaderTimeout`**，否则慢但健康的源站会在来得及应答前就被放弃。被放弃的 attempt 按**超时**处理（504）而非普通失败，且计入 `transfer` 阶段（弱信号）——按 connect 阶段全权重计入会误摘除慢节点。
+* **预算采用「放弃式」而非 `context.WithTimeout`**：request 的 ctx 会被
+  `resp.Body` 继承，加 deadline 会砍掉流式响应与大文件下载。
+* **被放弃的 attempt 不会被重试**：放弃只表示「不再等它」，不等于「换节点重发」——
+  该 attempt 的请求可能已经发出，重发有重复提交风险。它会一直跑到上游放弃为止
+  （由响应头超时兜底），其响应体/socket 在到达时由 `Cleanup` 释放。
+  **不要在此处 `cancel()`**：那会让它不再产生结果，`Cleanup` 因此永不触发，
+  反而把回收责任推回传输层（这一点曾被改错过一次，已回退）。
+* **attempt 预算不得短于 `ResponseHeaderTimeout`**，否则慢但健康的源站会在来得及
+  应答前就被放弃。被放弃的 attempt 按**超时**处理（504）而非普通失败。
+* **慢与坏必须区分**（见「稳定性可观测」一节）：区分依据是**错误性质而非阶段**——
+  同为 transfer 阶段，超时是慢、RST 是坏。慢失败降权计入健康度但**不进熔断**。
 * **有 body 的请求不重试**：服务端请求的 `GetBody` 恒为 nil，body 无法重放。因此重试实际只覆盖 GET/HEAD，POST/PUT 保持单次发送。这也是「页面打不开」最主要的表现场景。
 * **bypass 流量不参与 failover**：它没有节点可换。
 
@@ -483,6 +492,18 @@ failover 会带来一个副作用：请求最终成功了，于是「成功率�
       ——未测量的节点健康度为 1.0，直接展示会把「还没有数据」误读成
       「非常健康」。
     * 支持按 `success_rate` 排序，未测量的节点排在最后而不是当成满分。
+* **metrics.db 保留策略**：新增 `RESIN_METRIC_RETENTION_DAYS`（默认 30）。
+* **慢与坏必须区分**：失败按「是否可归因于慢」分流。
+    * **慢**（budget 耗尽、响应头超时）：记为 transfer 阶段失败，按
+      `health_transfer_failure_weight_percent` **降权计入健康度，但不计入
+      FailureCount、不触发熔断**。慢源站不是故障节点，把它计入熔断会摘除仍
+      在服务的节点。
+    * **坏**（拨号失败、连接被重置 RST）：按 connect/transfer 阶段正常计入，
+      可触发熔断。
+    * 实现上由 `attemptVerdict.slow` 判定，经 `RecordPassiveSlowFailure`
+      走独立通道。注意区分的**依据不是阶段**：同为 transfer 阶段，超时是慢、
+      RST 是坏。
+
 * **metrics.db 保留策略**：新增 `RESIN_METRIC_RETENTION_DAYS`（默认 30）。
   此前 metrics.db 完全没有清理——原来的 retention 配置只约束内存环形缓冲，
   落盘的历史桶会无限增长。清理挂在 bucket 循环上（约每小时一次），只按

@@ -55,6 +55,15 @@ func EnsureTableColumn(db *sql.DB, table, column, columnDDL string) error {
 	}
 	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, columnDDL)
 	if _, err := db.Exec(stmt); err != nil {
+		// The check above and this ALTER are not atomic, so another opener can
+		// have added the column in between. Re-check before treating the error
+		// as fatal: without this, a rolling restart where the old and new
+		// process briefly share the file would fail to start on
+		// "duplicate column name".
+		existsNow, checkErr := hasTableColumn(db, table, column)
+		if checkErr == nil && existsNow {
+			return nil
+		}
 		return fmt.Errorf("migrate %s.%s: %w", table, column, err)
 	}
 	return nil

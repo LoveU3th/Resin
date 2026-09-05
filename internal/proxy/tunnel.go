@@ -42,6 +42,12 @@ type tunnelPrepareResult struct {
 	upstreamStage string
 	upstreamErr   error
 	canceled      bool
+	// attempts and failedNodes describe how the tunnel was established, so the
+	// caller can report it: a CONNECT that only worked on the second node is a
+	// failover, and hiding that would make HTTPS failures invisible in the
+	// first-hop metric.
+	attempts    int
+	failedNodes []node.Hash
 }
 
 type tunnelRelayResult struct {
@@ -108,7 +114,7 @@ func prepareConnectTunnel(
 				return
 			}
 			if verdict.retryable {
-				recordPassiveStageResultAsync(deps.health, res, node.PassiveStageConnect, false)
+				reportTunnelFailure(deps.health, res, verdict)
 			}
 		},
 	})
@@ -116,31 +122,43 @@ func prepareConnectTunnel(
 	if result.Value != nil {
 		conn := result.Value
 		routed := result.Route
-		return buildPreparedTunnel(ctx, deps, routed, conn, target, domain)
+		prepared := buildPreparedTunnel(ctx, deps, routed, conn, target, domain)
+		prepared.attempts = result.Attempts
+		prepared.failedNodes = result.FailedNodes
+		return prepared
 	}
 
 	if result.RouteErr != nil {
 		return tunnelPrepareResult{proxyErr: result.RouteErr}
 	}
 
-	// report the last failure against the node it belongs to
-	var route routing.RouteResult
-	if len(result.FailedNodes) > 0 {
-		route.NodeHash = result.FailedNodes[len(result.FailedNodes)-1]
-	}
+	// The last failure belongs to the node the final attempt used. Keep its
+	// platform ID: losing it would disable the per-platform breaker opt-out.
+	route := result.LastRoute
 
 	proxyErr := classifyConnectError(result.LastErr)
 	if proxyErr == nil {
-		return tunnelPrepareResult{route: route, canceled: true}
+		return tunnelPrepareResult{
+			route:       route,
+			canceled:    true,
+			attempts:    result.Attempts,
+			failedNodes: result.FailedNodes,
+		}
 	}
-	if deps.health != nil {
-		recordPassiveStageResultAsync(deps.health, route, node.PassiveStageConnect, false)
+	// A retryable failure was already reported by OnAttempt as each attempt
+	// ended, so only a non-retryable one is recorded here — otherwise the last
+	// node is counted twice and evicted after half as many failures as
+	// configured.
+	if deps.health != nil && !result.LastVerdict.retryable {
+		reportTunnelFailure(deps.health, route, result.LastVerdict)
 	}
 	return tunnelPrepareResult{
 		route:         route,
 		proxyErr:      proxyErr,
 		upstreamStage: "connect_dial",
 		upstreamErr:   result.LastErr,
+		attempts:      result.Attempts,
+		failedNodes:   result.FailedNodes,
 	}
 }
 
@@ -374,4 +392,14 @@ func makeTunnelClientReader(clientConn net.Conn, buffered *bufio.Reader) (io.Rea
 		return nil, err
 	}
 	return io.MultiReader(bytes.NewReader(prefetched), clientConn), nil
+}
+
+// reportTunnelFailure records a failed tunnel dial. A dial that only timed out
+// means the node was slow to answer, so it must not count toward eviction.
+func reportTunnelFailure(health HealthRecorder, route routing.RouteResult, verdict attemptVerdict) {
+	if verdict.slow {
+		recordPassiveSlowFailureAsync(health, route)
+		return
+	}
+	recordPassiveStageResultAsync(health, route, verdict.stage, false)
 }

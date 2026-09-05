@@ -4,7 +4,8 @@ package requestlog
 
 import (
 	"database/sql"
-	"fmt"
+
+	"github.com/Resinat/Resin/internal/state"
 )
 
 // CreateDDL defines the schema for request log databases.
@@ -76,46 +77,10 @@ func ensureRequestLogSchema(db *sql.DB) error {
 	return ensureRequestLogColumn(db, "request_logs", "failover_nodes", "failover_nodes TEXT NOT NULL DEFAULT ''")
 }
 
+// ensureRequestLogColumn delegates to the shared implementation so the
+// check-then-act race around ALTER TABLE is handled in one place. This
+// previously had its own copy, which meant a fix applied to one would silently
+// miss the other.
 func ensureRequestLogColumn(db *sql.DB, table, column, columnDDL string) error {
-	exists, err := hasRequestLogColumn(db, table, column)
-	if err != nil {
-		return err
-	}
-	if exists {
-		return nil
-	}
-	stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s", table, columnDDL)
-	if _, err := db.Exec(stmt); err != nil {
-		return fmt.Errorf("migrate %s.%s: %w", table, column, err)
-	}
-	return nil
-}
-
-func hasRequestLogColumn(db *sql.DB, table, column string) (bool, error) {
-	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return false, fmt.Errorf("inspect table %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var (
-			cid       int
-			name      string
-			colType   string
-			notNull   int
-			defaultV  sql.NullString
-			primaryID int
-		)
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultV, &primaryID); err != nil {
-			return false, fmt.Errorf("scan table_info(%s): %w", table, err)
-		}
-		if name == column {
-			return true, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, fmt.Errorf("iterate table_info(%s): %w", table, err)
-	}
-	return false, nil
+	return state.EnsureTableColumn(db, table, column, columnDDL)
 }

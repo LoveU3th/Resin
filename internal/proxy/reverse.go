@@ -432,6 +432,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var failoverRT *reverseFailoverTransport
 
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
+		// Reaches the target without a node, so it must stay out of first-hop
+		// statistics: counting it as a flawless first hop would lift the rate
+		// and hide real node failures.
+		lifecycle.setWithoutNode()
 		transport = p.directHTTPTransport()
 	} else {
 		failoverRT = &reverseFailoverTransport{
@@ -457,7 +461,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				if verdict.retryable {
-					recordPassiveStageResultAsync(p.health, res, node.PassiveStageConnect, false)
+					p.reportAttemptFailure(res, verdict)
 					return
 				}
 				if verdict.deadConn {
@@ -505,13 +509,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// last node would be counted twice at full weight and pushed toward
 			// eviction for a single failed request.
 			if rt, ok := reverseFailedRoute(failoverRT); ok && !lastVerdict(failoverRT).retryable {
-				stage := node.PassiveStageConnect
-				if failoverRT != nil && failoverRT.result != nil && failoverRT.result.Abandoned {
-					// Ran out of budget: a slow origin is a weaker signal than an
-					// unreachable node.
-					stage = node.PassiveStageTransfer
-				}
-				recordPassiveStageResultAsync(p.health, rt, stage, false)
+				p.reportAttemptFailure(rt, lastVerdict(failoverRT))
 			}
 			writeProxyError(rw, proxyErr)
 		},
@@ -804,8 +802,9 @@ func reverseFailedRoute(rt *reverseFailoverTransport) (routing.RouteResult, bool
 	if len(rt.result.FailedNodes) == 0 {
 		return routing.RouteResult{}, false
 	}
-	last := rt.result.FailedNodes[len(rt.result.FailedNodes)-1]
-	return routing.RouteResult{NodeHash: last}, true
+	// Return the route as resolved, platform ID included: rebuilding it from a
+	// hash would drop the platform and disable the breaker opt-out.
+	return rt.result.LastRoute, true
 }
 
 // lastVerdict reports how the reverse proxy's final attempt was classified, so
@@ -815,4 +814,14 @@ func lastVerdict(rt *reverseFailoverTransport) attemptVerdict {
 		return attemptVerdict{}
 	}
 	return rt.result.LastVerdict
+}
+
+// reportAttemptFailure records one failed attempt against the node it belongs
+// to, routing slow-origin failures away from the breaker.
+func (p *ReverseProxy) reportAttemptFailure(route routing.RouteResult, verdict attemptVerdict) {
+	if verdict.slow {
+		recordPassiveSlowFailureAsync(p.health, route)
+		return
+	}
+	recordPassiveStageResultAsync(p.health, route, verdict.stage, false)
 }

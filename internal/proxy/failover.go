@@ -118,6 +118,16 @@ func (c *dialObserverConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// CloseWrite keeps the wrapper transparent for callers that half-close a
+// connection. The HTTP paths do not need it today, but a wrapper that silently
+// drops a method is a trap for whoever adds the next one.
+func (c *dialObserverConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errHalfCloseUnsupported
+}
+
 // attemptVerdict is the outcome of classifying a failed attempt.
 type attemptVerdict struct {
 	// retryable means the request provably did not reach the upstream, so
@@ -127,6 +137,20 @@ type attemptVerdict struct {
 	// about the node (a peer that vanished without a FIN), but it is not by
 	// itself enough to retry on.
 	deadConn bool
+	// stage is how the failure should be attributed to the node:
+	//
+	//	connect  — the node was never reached, so this is strong evidence
+	//	           against it and it counts at full weight toward the breaker.
+	//	transfer — the node was reached and the request went out, so the origin
+	//	           may simply be slow. It counts at reduced weight and must not
+	//	           feed the breaker, or a slow origin would evict a node that is
+	//	           working.
+	stage string
+	// slow means the failure is attributable to a slow origin rather than a
+	// broken node: the node was reached, it just did not answer in time. Such a
+	// failure must lower the health score but must not count toward eviction —
+	// a node serving slow traffic is still serving it.
+	slow bool
 }
 
 // FailoverConfig controls request-level failover.
@@ -185,6 +209,11 @@ type FailoverResult[T any] struct {
 	Attempts    int
 	FailedNodes []node.Hash
 	LastErr     error
+	// LastRoute is the node the final attempt used, carrying its platform ID.
+	// Callers must report failures through this rather than rebuilding a
+	// RouteResult from a hash: dropping the platform ID silently disables the
+	// per-platform circuit-breaker opt-out.
+	LastRoute routing.RouteResult
 	// LastVerdict is the classification of the final attempt. Callers use it to
 	// avoid recording a failure twice: a retryable attempt is already reported
 	// through OnAttempt, so only a non-retryable one needs reporting here.
@@ -210,6 +239,7 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 		failedNodes []node.Hash
 		lastErr     error
 		lastVerdict attemptVerdict
+		lastRoute   routing.RouteResult
 		abandoned   bool
 		attempts    int
 	)
@@ -232,6 +262,7 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 			if lastErr != nil {
 				return FailoverResult[T]{
 					LastErr:     lastErr,
+					LastRoute:   lastRoute,
 					LastVerdict: lastVerdict,
 					Attempts:    attempts,
 					FailedNodes: failedNodes,
@@ -266,11 +297,15 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 		}
 		verdict := p.classify(err, st)
 		if p.OnAttempt != nil {
-			p.OnAttempt(routed.Route, attemptVerdict{retryable: verdict.retryable, deadConn: verdict.deadConn})
+			// Pass the verdict through whole. Reconstructing it field by field
+			// would silently drop any field added later — which is exactly how
+			// the failure stage went missing once.
+			p.OnAttempt(routed.Route, verdict)
 		}
 
 		lastErr = err
 		lastVerdict = verdict
+		lastRoute = routed.Route
 		exclude = append(exclude, routed.Route.NodeHash)
 		failedNodes = append(failedNodes, routed.Route.NodeHash)
 
@@ -284,6 +319,7 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 
 	return FailoverResult[T]{
 		LastErr:     lastErr,
+		LastRoute:   lastRoute,
 		LastVerdict: lastVerdict,
 		Attempts:    attempts,
 		FailedNodes: failedNodes,
@@ -291,10 +327,25 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 	}
 }
 
+// attemptResult carries one attempt's outcome to whoever is waiting for it.
+type attemptResult[T any] struct {
+	value T
+	err   error
+}
+
 // runAttempt runs one attempt, giving up on it when the per-attempt budget
-// expires. The abandoned attempt is not cancelled: it finishes on its own and
-// its result is dropped, which is why its value must be discarded carefully by
-// the caller-supplied Run.
+// expires.
+//
+// A live attempt is never cancelled, because its context is inherited by the
+// response body and a deadline there would truncate streaming responses and
+// large downloads.
+//
+// An abandoned attempt is likewise not cancelled: it keeps running until the
+// upstream gives up on it, and its value is released on arrival by Cleanup.
+// Cancelling was tried and reverted — it stops the attempt producing a value at
+// all, so Cleanup never fires and the attempt's own teardown is left to the
+// transport instead. The upstream response-header timeout is what bounds how
+// long such an attempt can linger.
 func (p FailoverParams[T]) runAttempt(
 	ctx context.Context,
 	routed routedOutbound,
@@ -305,14 +356,10 @@ func (p FailoverParams[T]) runAttempt(
 		return p.Run(ctx, routed, st)
 	}
 
-	type attemptResult struct {
-		value T
-		err   error
-	}
-	done := make(chan attemptResult, 1)
+	done := make(chan attemptResult[T], 1)
 	go func() {
 		value, err := p.Run(ctx, routed, st)
-		done <- attemptResult{value: value, err: err}
+		done <- attemptResult[T]{value: value, err: err}
 	}()
 
 	timer := time.NewTimer(p.Config.AttemptBudget)
@@ -322,22 +369,34 @@ func (p FailoverParams[T]) runAttempt(
 	case res := <-done:
 		return res.value, res.err
 	case <-timer.C:
-		// Abandoned. The attempt keeps running in the background, so wait for it
-		// on its own and release whatever it produced — otherwise the response
-		// body (or a tunneled socket) is never closed.
-		if p.Cleanup != nil {
-			go func() {
-				if res := <-done; res.err == nil {
-					p.Cleanup(res.value)
-				}
-			}()
-		}
+		// Abandoned: the result will be dropped, so it is safe to stop waiting
+		// on the upstream. Then release whatever the attempt produces on its way
+		// down — otherwise the response body (or a tunneled socket) is never
+		// closed.
+		p.releaseOnArrival(done)
 		return zero, errAttemptAbandoned
 	case <-ctx.Done():
-		// The client went away. Nothing to release: the transport observes the
-		// cancellation itself.
+		// The client went away, but the attempt may still finish and produce
+		// something worth releasing. http.Transport does unwind its own state on
+		// cancellation, yet a tunneled socket does not: dialTunnelConn returns a
+		// connection whose context is only cancelled when it is closed, so
+		// dropping it here would leave an fd and a child context behind.
+		p.releaseOnArrival(done)
 		return zero, ctx.Err()
 	}
+}
+
+// releaseOnArrival waits for an attempt that is no longer being waited on and
+// releases whatever it eventually produces.
+func (p FailoverParams[T]) releaseOnArrival(done chan attemptResult[T]) {
+	if p.Cleanup == nil {
+		return
+	}
+	go func() {
+		if res := <-done; res.err == nil {
+			p.Cleanup(res.value)
+		}
+	}()
 }
 
 func (p FailoverParams[T]) classify(err error, st *AttemptState) attemptVerdict {
@@ -377,8 +436,12 @@ func classifyEstablishmentFailure(err error, st *AttemptState) attemptVerdict {
 
 	// An abandoned attempt is still running in the background, so whether its
 	// request was sent is unknown. Guessing risks a duplicate submission.
+	// It ran out of budget, which is the signature of a slow origin rather than
+	// an unreachable node, so it is attributed to the transfer stage.
 	if errors.Is(err, errAttemptAbandoned) {
-		return attemptVerdict{deadConn: deadConn}
+		// Ran out of budget: the node was reached but the origin did not answer
+		// in time. That is slowness, not breakage.
+		return attemptVerdict{deadConn: deadConn, stage: node.PassiveStageTransfer, slow: true}
 	}
 
 	switch {
@@ -392,15 +455,28 @@ func classifyEstablishmentFailure(err error, st *AttemptState) attemptVerdict {
 		// that fail before any byte was sent, so an error surfacing here means
 		// either that retry also failed or bytes had gone out. The counter
 		// includes earlier requests and cannot settle it, so do not retry.
-		return attemptVerdict{deadConn: true}
+		return attemptVerdict{deadConn: true, stage: node.PassiveStageTransfer}
 	case !st.dialSucceeded.Load():
-		// The dial failed: no connection, nothing sent.
-		return attemptVerdict{retryable: true, deadConn: deadConn}
+		// The dial failed: no connection, nothing sent. The node really was
+		// unreachable, so this is a connect-stage failure.
+		return attemptVerdict{retryable: true, deadConn: deadConn, stage: node.PassiveStageConnect}
 	case st.dialed() && st.bytesWritten() == 0:
-		// Fresh connection and the request was never written.
-		return attemptVerdict{retryable: true, deadConn: deadConn}
+		// Fresh connection and the request was never written: the node was
+		// reached, so this is weaker than an unreachable node, but nothing was
+		// handed to the origin either. Treat it as connect — a node that accepts
+		// a connection and then drops it before any byte is written is broken,
+		// not slow.
+		return attemptVerdict{retryable: true, deadConn: deadConn, stage: node.PassiveStageConnect}
 	default:
-		return attemptVerdict{deadConn: deadConn}
+		// Bytes were written, so the origin had the request. Whether this is
+		// slowness or breakage decides if the node may be evicted: a timeout
+		// means the origin did not answer, while a reset means the node (or the
+		// origin) actively tore the connection down.
+		return attemptVerdict{
+			deadConn: deadConn,
+			stage:    node.PassiveStageTransfer,
+			slow:     isTimeoutError(err),
+		}
 	}
 }
 
@@ -468,6 +544,13 @@ type reverseFailoverTransport struct {
 
 	// result is kept so the caller can see which node served the request, which
 	// ones were tried, and whether the failure was retryable.
+	//
+	// Unlike `current` this is a plain pointer, not an atomic: it is written at
+	// the end of RoundTrip and read afterwards by ErrorHandler, ModifyResponse
+	// and the caller, all of which httputil.ReverseProxy runs on the same
+	// goroutine that called RoundTrip. Do not read it from anywhere else — in
+	// particular not from inside Run, which may be running on an attempt
+	// goroutine.
 	result *FailoverResult[*http.Response]
 
 	// current is the node of the attempt in flight. ModifyResponse runs while

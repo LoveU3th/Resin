@@ -30,6 +30,18 @@ type stagedPassiveHealthRecorder interface {
 	RecordPassiveStageResult(platformID string, hash node.Hash, stage string, success bool)
 }
 
+// slowPassiveHealthRecorder records a failure that means "the origin was slow"
+// rather than "the node is broken": the node was reached and answered, just not
+// fast enough. Optional, like the staged one.
+//
+// It exists because such a failure must not feed the breaker. A node that is
+// merely slow is still serving traffic, and evicting it would remove capacity
+// that works. It does lower the health score, so a node that is genuinely slow
+// still loses selection weight.
+type slowPassiveHealthRecorder interface {
+	RecordPassiveSlowFailure(platformID string, hash node.Hash)
+}
+
 func recordPassiveResultAsync(health HealthRecorder, route routing.RouteResult, success bool) {
 	recordPassiveStageResultAsync(health, route, node.PassiveStageConnect, success)
 }
@@ -77,4 +89,24 @@ func recordConnDropAsync(health HealthRecorder, route routing.RouteResult) {
 	if recorder, ok := health.(connDropRecorder); ok {
 		go recorder.RecordConnDrop(route.PlatformID, route.NodeHash)
 	}
+}
+
+// recordPassiveSlowFailureAsync reports a failure attributable to a slow origin
+// rather than a broken node.
+//
+// The distinction matters for the breaker: this lowers the health score but
+// deliberately does not count toward eviction. Reporting it as an ordinary
+// failure would eventually eject a node that is working, which is the opposite
+// of what the breaker is for.
+func recordPassiveSlowFailureAsync(health HealthRecorder, route routing.RouteResult) {
+	if health == nil {
+		return
+	}
+	if recorder, ok := health.(slowPassiveHealthRecorder); ok {
+		go recorder.RecordPassiveSlowFailure(route.PlatformID, route.NodeHash)
+		return
+	}
+	// Recorders without the distinction cannot tell slow from broken, so fall
+	// back to the weaker transfer-stage failure: it is the closest match.
+	recordPassiveStageResultAsync(health, route, node.PassiveStageTransfer, false)
 }

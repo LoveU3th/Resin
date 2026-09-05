@@ -155,6 +155,10 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 	if prepare.route.PlatformID != "" {
 		lifecycle.setRouteResult(prepare.route)
 	}
+	// Report failover here too: a CONNECT that only worked on the second node
+	// is a failover, and leaving it unreported would make HTTPS failures
+	// invisible in the first-hop metric.
+	lifecycle.recordFailover(prepare.attempts, prepare.failedNodes)
 	if prepare.session == nil {
 		if prepare.proxyErr != nil {
 			lifecycle.setProxyError(prepare.proxyErr)

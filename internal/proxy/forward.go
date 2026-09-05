@@ -463,8 +463,11 @@ func (p *ForwardProxy) forwardViaNodes(
 				return
 			}
 			if verdict.retryable {
-				// The node never received the request, so it failed to serve it.
-				recordPassiveStageResultAsync(p.health, res, node.PassiveStageConnect, false)
+				// The node never got the request far enough to be useful. Which
+				// stage it lands in decides the weight: a node that could not be
+				// reached counts at full weight, one that was merely slow must
+				// not, or slow origins would evict working nodes.
+				p.reportAttemptFailure(res, verdict)
 				return
 			}
 			if verdict.deadConn {
@@ -514,16 +517,20 @@ func (p *ForwardProxy) forwardViaNodes(
 	// would count the same node twice at full weight, and that feeds the
 	// breaker — enough of it would evict a node for one failed request.
 	if !result.LastVerdict.retryable && len(result.FailedNodes) > 0 {
-		stage := node.PassiveStageConnect
-		if result.Abandoned {
-			// Ran out of budget, which usually means a slow origin rather than
-			// an unreachable node, so it is the weaker signal.
-			stage = node.PassiveStageTransfer
-		}
-		last := result.FailedNodes[len(result.FailedNodes)-1]
-		recordPassiveStageResultAsync(p.health, routing.RouteResult{NodeHash: last}, stage, false)
+		p.reportAttemptFailure(result.LastRoute, result.LastVerdict)
 	}
 	writeProxyError(w, proxyErr)
+}
+
+// reportAttemptFailure records one failed attempt against the node it belongs
+// to. Failures attributable to a slow origin go down a separate path that skips
+// the breaker, so slowness cannot evict a node that is still serving traffic.
+func (p *ForwardProxy) reportAttemptFailure(route routing.RouteResult, verdict attemptVerdict) {
+	if verdict.slow {
+		recordPassiveSlowFailureAsync(p.health, route)
+		return
+	}
+	recordPassiveStageResultAsync(p.health, route, verdict.stage, false)
 }
 
 func wrapForwardBody(body io.ReadCloser) *countingReadCloser {
@@ -593,6 +600,10 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	if prepare.route.PlatformID != "" {
 		lifecycle.setRouteResult(prepare.route)
 	}
+	// Report failover here too: a CONNECT that only worked on the second node
+	// is a failover, and leaving it unreported would make HTTPS failures
+	// invisible in the first-hop metric.
+	lifecycle.recordFailover(prepare.attempts, prepare.failedNodes)
 	if prepare.session == nil {
 		if prepare.proxyErr != nil {
 			lifecycle.setProxyError(prepare.proxyErr)
