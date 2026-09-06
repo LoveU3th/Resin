@@ -250,15 +250,40 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if !containsHash(exclude, current.NodeHash) {
-			if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
-				return newLease, xsync.UpdateOp, hitResult, nil
+		excluded := containsHash(exclude, current.NodeHash)
+
+		// A node whose own score says it is failing must not be handed out on a
+		// lease hit — but the account must not be relocated either, so this
+		// request borrows another node. Checked before the hit is recorded on
+		// purpose: recording it would emit a LeaseTouch for a request the node
+		// does not actually serve.
+		if !excluded && r.leaseNodeStillServes(plat, current) &&
+			r.healthWeights().rejects(r.pool, current.NodeHash) {
+			if borrowed, ok := r.borrowRoute(plat, state, current, targetDomain, nowNs,
+				excludeAlso(exclude, current.NodeHash)); ok {
+				return current, xsync.CancelOp, borrowed, nil
 			}
-		} else if borrowed, ok := r.borrowRoute(plat, state, current, targetDomain, nowNs, exclude); ok {
-			// The sticky node is unusable for this request only. Hand out another
-			// node without touching the lease (CancelOp), so a single failure
-			// does not relocate the account's egress IP.
-			return current, xsync.CancelOp, borrowed, nil
+			// Nothing to borrow — a single-node platform, or every alternative
+			// is filtered out too. Fall through and keep serving the lease:
+			// health must never turn a routable lease into a failed request,
+			// nor into lease churn.
+		}
+
+		hitLease, hitResult, hitOK := Lease{}, RouteResult{}, false
+		if !excluded {
+			hitLease, hitResult, hitOK = r.tryLeaseHit(plat, account, current, nowNs)
+		}
+		if hitOK {
+			return hitLease, xsync.UpdateOp, hitResult, nil
+		}
+
+		if excluded {
+			if borrowed, ok := r.borrowRoute(plat, state, current, targetDomain, nowNs, exclude); ok {
+				// The sticky node is unusable for this request only. Hand out another
+				// node without touching the lease (CancelOp), so a single failure
+				// does not relocate the account's egress IP.
+				return current, xsync.CancelOp, borrowed, nil
+			}
 		}
 		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs, exclude); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
@@ -319,14 +344,29 @@ func (r *Router) createOrAbortStickyLease(
 	return newLease, xsync.UpdateOp, createdResult, nil
 }
 
+// leaseNodeStillServes reports whether the leased node would still be handed
+// out on a hit: present in the platform's routable view and still answering
+// from the same egress IP.
+//
+// Split out of tryLeaseHit so the health check can be made on the same premise
+// without recording the hit. That matters: borrowing around a node the lease
+// would never have hit would pin the account to a dead node for a whole TTL,
+// where the old code rotated or recreated the lease straight away.
+func (r *Router) leaseNodeStillServes(plat *platform.Platform, current Lease) bool {
+	entry, ok := r.pool.GetEntry(current.NodeHash)
+	if !ok || entry == nil {
+		return false
+	}
+	return plat.View().Contains(current.NodeHash) && entry.GetEgressIP() == current.EgressIP
+}
+
 func (r *Router) tryLeaseHit(
 	plat *platform.Platform,
 	account string,
 	current Lease,
 	nowNs int64,
 ) (Lease, RouteResult, bool) {
-	entry, ok := r.pool.GetEntry(current.NodeHash)
-	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
+	if !r.leaseNodeStillServes(plat, current) {
 		return Lease{}, RouteResult{}, false
 	}
 
@@ -717,6 +757,18 @@ func containsHash(haystack []node.Hash, needle node.Hash) bool {
 		}
 	}
 	return false
+}
+
+// excludeAlso returns exclude with h appended, leaving the caller's slice (and
+// its backing array) untouched — RouteOptions.Exclude is owned by the caller
+// and may be shared across attempts.
+func excludeAlso(exclude []node.Hash, h node.Hash) []node.Hash {
+	if containsHash(exclude, h) {
+		return exclude
+	}
+	out := make([]node.Hash, 0, len(exclude)+1)
+	out = append(out, exclude...)
+	return append(out, h)
 }
 
 // borrowRoute hands out a node for this request only, leaving the caller's

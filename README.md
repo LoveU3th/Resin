@@ -32,7 +32,7 @@ It helps shield your services from unstable underlying proxy nodes by aggregatin
 - **Simple and powerful**: Works out of the box with default settings, while still offering deep customization for enterprise-grade needs.
 - **Cross-subscription deduplication**: Automatically merges identical nodes from different subscriptions and shares their health state.
 - **Hot reload**: Update common settings without restart. Refresh subscriptions without dropping existing traffic.
-- **Persistent state**: Keeps node health, latency stats, and lease bindings across restarts.
+- **Persistent state**: Restores circuit-breaker state, failure counts, egress IPs, latency stats, and lease bindings across restarts. Per-node success-rate scores are not persisted — they rebuild from scratch after a restart.
 - **Zero-intrusion sticky access**: Can extract account identity from existing request headers (for example API keys), so clients often need no code changes.
 - **Incremental subscription refresh**: Syncs subscription updates without interrupting current connections.
 - **Flexible node isolation**: Use Platform rules (regex, region, etc.) to build independent proxy pools for different business scenarios.

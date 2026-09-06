@@ -54,6 +54,54 @@ func (w HealthWeights) allows(pool PoolAccessor, h node.Hash) bool {
 	return entry.HealthScore()*100 >= float64(w.FilterThresholdPercent)
 }
 
+// rejects is the inverse of allows for nodes whose health is actually known.
+//
+// Unlike !allows it stays false when the score cannot be read or is not backed
+// by enough observations: "not yet measured" must never be read as "bad", so
+// the two answers agree on the only case that matters — a node is rejected
+// only once its own track record says so. Unmeasured nodes are held back by
+// the scoring penalty instead.
+func (w HealthWeights) rejects(pool PoolAccessor, h node.Hash) bool {
+	if w.FilterThresholdPercent <= 0 || w.MinSamplesForFilter <= 0 {
+		return false
+	}
+	entry, ok := pool.GetEntry(h)
+	if !ok || entry == nil {
+		return false
+	}
+	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {
+		return false
+	}
+	return entry.HealthScore()*100 < float64(w.FilterThresholdPercent)
+}
+
+// healthPenalty turns a node's health into a score penalty in nanoseconds.
+//
+// A node with too few observations starts at a perfect 1.0, so on score alone it
+// ties with a node that has served thousands of successful requests. Paying for
+// the doubt fixes that: the taper charges the full penalty at zero observations
+// and nothing once the score is backed by enough evidence, which is the same
+// line HealthWeights.allows draws for filtering — the two can then never
+// disagree about what "not yet measured" means.
+//
+// The penalty is the larger of the two rather than their sum, so a node that has
+// already proven itself bad is not charged twice for the same doubt.
+func healthPenalty(entry *node.NodeEntry, w HealthWeights) float64 {
+	if entry == nil || w.PenaltyNs <= 0 {
+		return 0
+	}
+	penalty := (1 - entry.HealthScore()) * w.PenaltyNs
+	if w.MinSamplesForFilter > 0 {
+		if samples := entry.HealthSamples(); samples < uint32(w.MinSamplesForFilter) {
+			ramp := 1 - float64(samples)/float64(w.MinSamplesForFilter)
+			if unknown := ramp * w.PenaltyNs; unknown > penalty {
+				penalty = unknown
+			}
+		}
+	}
+	return penalty
+}
+
 var randomRouteRNGPool = sync.Pool{
 	New: func() any {
 		return rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
@@ -286,8 +334,6 @@ func calculateScore(
 
 	// Health penalty, applied the same way under every policy. A fully healthy
 	// node adds nothing, so an all-healthy fleet is unaffected.
-	if entry != nil && health.PenaltyNs > 0 {
-		score += (1 - entry.HealthScore()) * health.PenaltyNs
-	}
+	score += healthPenalty(entry, health)
 	return score
 }
