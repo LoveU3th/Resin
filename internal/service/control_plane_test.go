@@ -179,6 +179,13 @@ func TestValidateRuntimeConfig_ValidConfig(t *testing.T) {
 }
 
 func TestRuntimeConfigPatchAllowlist_StaysInSyncWithRuntimeConfigJSONFields(t *testing.T) {
+	// Fields that describe the stored document rather than a setting: they are
+	// persisted and returned by GET, but must never come from a PATCH body.
+	// Adding one means deciding it here, on purpose.
+	internalFields := map[string]struct{}{
+		"schema_version": {},
+	}
+
 	rt := reflect.TypeOf(config.RuntimeConfig{})
 	jsonFields := make(map[string]struct{})
 	for i := 0; i < rt.NumField(); i++ {
@@ -188,6 +195,9 @@ func TestRuntimeConfigPatchAllowlist_StaysInSyncWithRuntimeConfigJSONFields(t *t
 		}
 		name := strings.Split(tag, ",")[0]
 		if name == "" || name == "-" {
+			continue
+		}
+		if _, ok := internalFields[name]; ok {
 			continue
 		}
 		jsonFields[name] = struct{}{}

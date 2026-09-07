@@ -2,9 +2,24 @@ package config
 
 import "time"
 
+// RuntimeConfigSchemaVersion marks the shape of a persisted RuntimeConfig.
+// Bump it whenever fields are added, and list them in
+// applyRuntimeConfigMigrations under the new version.
+//
+// A config written before this mechanism existed has no schema_version key and
+// reads back as 0, which is exactly what a config written by an old release
+// looks like — so 0 means "predates versioning" rather than "version 0".
+const RuntimeConfigSchemaVersion = 1
+
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
 type RuntimeConfig struct {
+	// SchemaVersion records which set of fields this config was written with.
+	// Fields added by a later release are filled in on load; see
+	// applyRuntimeConfigMigrations. Not patchable: it describes the stored
+	// document, it is not a setting.
+	SchemaVersion int `json:"schema_version"`
+
 	// Request log
 	RequestLogEnabled                  bool `json:"request_log_enabled"`
 	RequestLogTotalMaxMB               int  `json:"request_log_total_max_mb"`
@@ -82,6 +97,8 @@ type RuntimeConfig struct {
 // values specified in DESIGN.md §运行时全局设置项.
 func NewDefaultRuntimeConfig() *RuntimeConfig {
 	return &RuntimeConfig{
+		SchemaVersion: RuntimeConfigSchemaVersion,
+
 		RequestLogEnabled:                  true,
 		RequestLogTotalMaxMB:               200,
 		ReverseProxyLogDetailEnabled:       false,
@@ -137,40 +154,89 @@ func ApplyCompatibilityDefaults(cfg *RuntimeConfig, envCfg *EnvConfig) (*Runtime
 		changed = true
 	}
 
-	// Everything below was introduced after this config was first persisted, so
-	// an upgraded config lacks the fields and reads them back as zero. Some of
-	// those zeros silently switch the new behaviour off — worst of all for a
-	// boolean, where "missing" and "explicitly disabled" look alike.
-	//
-	// Only fields whose zero value *disables* the feature are backfilled. Fields
-	// where zero is a meaningful setting (CircuitCooldown = 0 disables cooling,
-	// HealthPenaltyMs = 0 disables the latency penalty) are left alone: once an
-	// operator sets them to zero on purpose, overwriting that on every restart
-	// would be its own bug.
+	// MaxConsecutiveFailures predates the schema-versioning below, so it is
+	// still backfilled unconditionally. Zero means the breaker never fires (the
+	// check is `> 0 &&`), and for a field this old there is no way left to tell
+	// a missing key from an operator's deliberate zero.
 	if out.MaxConsecutiveFailures <= 0 {
 		// Zero means the breaker never fires: the check is `> 0 &&`.
 		out.MaxConsecutiveFailures = 3
 		changed = true
 	}
-	if out.HealthMinSamplesForFilter <= 0 {
-		// Zero would report a success rate with no observations behind it.
-		out.HealthMinSamplesForFilter = 8
-		changed = true
-	}
 
-	// Failover is keyed off MaxAttempts rather than Enabled: Enabled is a bool,
-	// so a config that predates the feature and one that deliberately disables
-	// it are indistinguishable. MaxAttempts is validated to be at least 1, so a
-	// zero can only mean "never configured".
-	if out.FailoverMaxAttempts <= 0 {
-		out.FailoverEnabled = true
-		out.FailoverMaxAttempts = 2
-		out.FailoverAttemptBudget = Duration(60 * time.Second)
-		out.FailoverTotalBudget = Duration(90 * time.Second)
+	// Fields added by a release are filled in once, on the upgrade that
+	// introduces them — see applyRuntimeConfigMigrations.
+	if applyRuntimeConfigMigrations(&out) {
 		changed = true
 	}
 
 	return &out, changed
+}
+
+// applyRuntimeConfigMigrations fills in fields that did not exist yet when the
+// persisted config was written, then stamps it with the current schema version
+// so the fill-in happens exactly once per upgrade.
+//
+// Only zero values are filled, so anything the operator has already touched
+// keeps its value. That leaves one unavoidable trade-off: an operator who set a
+// new field to 0 before this mechanism existed has that 0 replaced once, on the
+// upgrade that introduces it. The alternative is what shipped before — a
+// missing key reads back as 0 and silently switches the feature off, which no
+// amount of documentation talked anyone out of.
+func applyRuntimeConfigMigrations(cfg *RuntimeConfig) bool {
+	if cfg.SchemaVersion >= RuntimeConfigSchemaVersion {
+		return false
+	}
+
+	defaults := NewDefaultRuntimeConfig()
+
+	if cfg.SchemaVersion < 1 {
+		// v1: node health scoring and request-level failover.
+		//
+		// An old release cannot have written these fields, so a zero here means
+		// "never set" rather than "set to zero" — unlike MaxConsecutiveFailures
+		// above, which predates this scheme and can be any operator value.
+		if cfg.HealthEwmaWindow <= 0 {
+			cfg.HealthEwmaWindow = defaults.HealthEwmaWindow
+		}
+		if cfg.HealthEwmaMinSamples <= 0 {
+			cfg.HealthEwmaMinSamples = defaults.HealthEwmaMinSamples
+		}
+		if cfg.HealthPenaltyMs == 0 {
+			cfg.HealthPenaltyMs = defaults.HealthPenaltyMs
+		}
+		if cfg.HealthFilterThresholdPercent == 0 {
+			cfg.HealthFilterThresholdPercent = defaults.HealthFilterThresholdPercent
+		}
+		if cfg.HealthMinSamplesForFilter <= 0 {
+			cfg.HealthMinSamplesForFilter = defaults.HealthMinSamplesForFilter
+		}
+		if cfg.CircuitCooldown == 0 {
+			cfg.CircuitCooldown = defaults.CircuitCooldown
+		}
+		if cfg.CircuitMaxCooldown == 0 {
+			cfg.CircuitMaxCooldown = defaults.CircuitMaxCooldown
+		}
+		if cfg.HealthRecoveryFloorPercent == 0 {
+			cfg.HealthRecoveryFloorPercent = defaults.HealthRecoveryFloorPercent
+		}
+		if cfg.HealthTransferFailureWeightPercent == 0 {
+			cfg.HealthTransferFailureWeightPercent = defaults.HealthTransferFailureWeightPercent
+		}
+		// Failover is keyed off MaxAttempts rather than Enabled: Enabled is a
+		// bool, so a config that predates the feature and one that deliberately
+		// disables it are indistinguishable. MaxAttempts is validated to be at
+		// least 1, so a zero can only mean "never configured".
+		if cfg.FailoverMaxAttempts <= 0 {
+			cfg.FailoverEnabled = defaults.FailoverEnabled
+			cfg.FailoverMaxAttempts = defaults.FailoverMaxAttempts
+			cfg.FailoverAttemptBudget = defaults.FailoverAttemptBudget
+			cfg.FailoverTotalBudget = defaults.FailoverTotalBudget
+		}
+	}
+
+	cfg.SchemaVersion = RuntimeConfigSchemaVersion
+	return true
 }
 
 func defaultRequestLogTotalMaxMB(envCfg *EnvConfig) int {

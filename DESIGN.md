@@ -2497,6 +2497,16 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 * `MaxAuthorityLatencyTestInterval`: 权威域名（如 cloudflare.com）的最大延迟探测间隔。最小 30 秒。默认 3 小时。
 * `MaxEgressTestInterval`: 节点出口 IP 探测的最大间隔。最小 30 秒。默认 1 天。
 
+#### 节点健康度与熔断
+* `HealthEwmaWindow`：健康度评分（成功率 EWMA）的有效跨度，`alpha = 1 / window`。默认 20。
+* `HealthEwmaMinSamples`：观测数低于该值时使用更大的 alpha，让新节点快速收敛。默认 5。
+* `HealthPenaltyMs`：健康度对选路打分的最高惩罚，按 `(1 - 成功率) × 该值` 加成。默认 2000。**设为 0 会关闭整个健康惩罚**，包括未测量节点的降权。
+* `HealthFilterThresholdPercent`：成功率低于该值且观测数足够时，不再作为 P2C 候选。默认 40，设为 0 关闭过滤。
+* `HealthMinSamplesForFilter`：过滤与成功率展示所需的观测数。默认 8。样本不足的节点一律放行，只承担打分上的未知惩罚。
+* `CircuitCooldown` / `CircuitMaxCooldown`：熔断后的最短冷却与退避上限。默认 30 秒 / 30 分钟。0 表示禁用冷却。
+* `HealthRecoveryFloorPercent`：熔断关闭时健康度被抬到的地板值，须高于过滤阈值，避免节点凭旧分数立刻被过滤。默认 60。
+* `HealthTransferFailureWeightPercent`：传输阶段失败（连接后超时、被重置）计入健康度的权重。默认 50，**设为 0 则这类失败完全不记账**。
+
 #### 探测设置
 * `LatencyTestURL`: 主动延迟探测的目标 URL。默认 `https://www.gstatic.com/generate_204`。一定属于 LatencyAuthorities 之一。如果不属于就加入。
 * `LatencyAuthorities`: 权威域名列表。默认 `["gstatic.com", "google.com", "cloudflare.com", "github.com"]`。
@@ -2511,6 +2521,16 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 
 > `EphemeralNodeEvictDelay` 不属于全局配置，已改为订阅级字段 `ephemeral_node_evict_delay`（默认 72h）。
 
+#### 配置版本与迁移
+运行时配置整体以 JSON 存在数据库里，新增字段在旧配置中读回为零值——若不加处理，新功能会**静默失效**（典型症状：升级后健康度相关功能一个都没生效，但配置接口看不出异常）。因此配置带 `schema_version`：
+
+* 加载时若版本号低于当前版本，按版本清单为该版本新增的字段补默认值。**只补仍为零值的字段**：运维已改过的值一律不动。
+* 补完立即写入当前版本号，因此**每个版本只补一次**。此后运维再设为 0 就是"显式关闭"，重启不会被覆盖。
+* 唯一取舍：在该机制出现之前就把某个新字段显式设为 0 的运维，会在升级时被补成默认值一次，重新设回 0 即可。
+* `schema_version` 是描述存储文档的内部字段，不可以通过 PATCH 修改。
+* `MaxConsecutiveFailures` 早于该机制，仍是无条件回填——它的 0 值表示熔断器永不触发，已无法区分"字段缺失"与"显式设为 0"。
+
+新增运行时配置项时：在 `internal/config/runtime.go` 里同时提高 `RuntimeConfigSchemaVersion`，并把新字段列入 `applyRuntimeConfigMigrations` 对应版本，再把字段名加入 `internal/service/control_plane_system.go` 的 `runtimeConfigAllowedFields`（若允许热更新）。
 
 # WebUI 布局
 
