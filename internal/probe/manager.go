@@ -472,6 +472,33 @@ func (m *ProbeManager) scanEgress() {
 	})
 }
 
+const (
+	// halfOpenProbeFloor is the shortest time between two latency probes of a
+	// half-open node.
+	halfOpenProbeFloor = 30 * time.Second
+	// halfOpenProbeDivisor relates that interval to the node's current breaker
+	// cooldown, which doubles on every failed half-open attempt.
+	halfOpenProbeDivisor = 4
+)
+
+// halfOpenProbeInterval spaces out the probes of a half-open node.
+//
+// Tying the interval to the node's own cooldown keeps a freshly isolated node
+// coming back quickly — 30s at a 2m cooldown — while a node that has been
+// failing for hours thins out on its own: at the 30m cap it is probed every
+// 7.5m instead of every scan. That matters because a saturated cooldown leaves
+// the node permanently half-open (see NodeEntry.CircuitState), so nothing else
+// would ever slow the retries down.
+func halfOpenProbeInterval(circuitCooldownNs int64) time.Duration {
+	if circuitCooldownNs <= 0 {
+		return halfOpenProbeFloor
+	}
+	if interval := time.Duration(circuitCooldownNs) / halfOpenProbeDivisor; interval > halfOpenProbeFloor {
+		return interval
+	}
+	return halfOpenProbeFloor
+}
+
 // scanLatency iterates all pool nodes and probes those due for latency check.
 func (m *ProbeManager) scanLatency() {
 	now := time.Now()
@@ -511,7 +538,17 @@ func (m *ProbeManager) scanLatency() {
 		// hour by default) would make the cooldown unobservable and leave
 		// recovery to chance. Without this, a node isolated for 30s typically
 		// stays out for up to an hour.
+		//
+		// The bypass is spaced out rather than unconditional. A node whose
+		// cooldown has saturated at circuit_max_cooldown stays half-open
+		// indefinitely — the open timestamp is deliberately left at the first
+		// isolation — so an unconditional bypass retries a dead node on every
+		// scan, for as long as it stays dead.
 		if entry.IsHalfOpen() {
+			if last := entry.LastLatencyProbeAttempt.Load(); last > 0 &&
+				now.Sub(time.Unix(0, last)) < halfOpenProbeInterval(entry.CircuitCooldownNs.Load()) {
+				return true
+			}
 			m.enqueueProbe(h, probeTaskKindLatency, probePriorityNormal)
 			return true
 		}

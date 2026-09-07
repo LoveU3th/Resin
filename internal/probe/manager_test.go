@@ -1037,8 +1037,9 @@ func TestScanLatency_HalfOpenNodeBypassesIntervalGate(t *testing.T) {
 	if !entry.IsHalfOpen() {
 		t.Fatalf("precondition: node should be half-open, got %v", entry.CircuitState(time.Now()))
 	}
-	// Probed moments ago, which the normal interval gate would refuse.
-	entry.LastLatencyProbeAttempt.Store(time.Now().UnixNano())
+	// Probed 40s ago: far inside the normal interval gate (an hour), but past
+	// the half-open floor, which is what the gate used to insist on.
+	entry.LastLatencyProbeAttempt.Store(time.Now().Add(-40 * time.Second).UnixNano())
 
 	mgr := newScanTestManager(pool)
 	mgr.scanLatency()
@@ -1086,5 +1087,94 @@ func TestScanLatency_RecentlyProbedNodeStaysGated(t *testing.T) {
 		t.Fatalf("recently probed node should not be queued, got %v", task.key)
 	case <-time.After(150 * time.Millisecond):
 		// Expected: nothing queued.
+	}
+}
+
+// The bypass is not a blank cheque: a half-open node probed moments ago still
+// waits for the floor, otherwise every scan re-probes it.
+func TestScanLatency_HalfOpenNodeWaitsForProbeFloor(t *testing.T) {
+	pool, sub := newScanTestPool()
+	_, entry := addScanTestNode(t, pool, sub, `{"type":"half-open-floor"}`)
+
+	entry.CircuitOpenSince.Store(time.Now().Add(-time.Minute).UnixNano())
+	entry.CircuitCooldownNs.Store(int64(30 * time.Second))
+	if !entry.IsHalfOpen() {
+		t.Fatal("precondition: node should be half-open")
+	}
+	// Probed 5s ago — inside the 30s floor.
+	entry.LastLatencyProbeAttempt.Store(time.Now().Add(-5 * time.Second).UnixNano())
+
+	mgr := newScanTestManager(pool)
+	mgr.scanLatency()
+
+	done := make(chan probeTask, 1)
+	go func() {
+		if task, ok := mgr.taskQueue.Dequeue(); ok {
+			done <- task
+		}
+	}()
+	select {
+	case task := <-done:
+		t.Fatalf("a half-open node probed 5s ago should not be queued again, got %v", task.key)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: nothing queued.
+	}
+}
+
+// The case the floor exists for: a node whose cooldown has saturated at
+// circuit_max_cooldown never stops being half-open, because the open timestamp
+// stays at the first isolation. With nothing to space it out, the bypass fires
+// on every scan and a dead node is retried every ~15s indefinitely.
+func TestScanLatency_SaturatedCooldownThinsOutProbes(t *testing.T) {
+	pool, sub := newScanTestPool()
+	_, entry := addScanTestNode(t, pool, sub, `{"type":"saturated"}`)
+
+	// Open for hours with the cooldown saturated at the 30m cap: the node is
+	// permanently half-open.
+	entry.CircuitOpenSince.Store(time.Now().Add(-3 * time.Hour).UnixNano())
+	entry.CircuitCooldownNs.Store(int64(30 * time.Minute))
+	if !entry.IsHalfOpen() {
+		t.Fatal("precondition: node should be half-open")
+	}
+	// Probed a minute ago: fine for a freshly isolated node, far too soon here.
+	entry.LastLatencyProbeAttempt.Store(time.Now().Add(-time.Minute).UnixNano())
+
+	mgr := newScanTestManager(pool)
+	mgr.scanLatency()
+
+	done := make(chan probeTask, 1)
+	go func() {
+		if task, ok := mgr.taskQueue.Dequeue(); ok {
+			done <- task
+		}
+	}()
+	select {
+	case task := <-done:
+		t.Fatalf("a node with a saturated cooldown should not be re-probed after a minute, got %v", task.key)
+	case <-time.After(150 * time.Millisecond):
+		// Expected: nothing queued.
+	}
+}
+
+// The interval follows the node's own cooldown, so recovery stays quick for a
+// fresh node while a long-dead one thins out on its own.
+func TestHalfOpenProbeInterval(t *testing.T) {
+	cases := []struct {
+		name     string
+		cooldown time.Duration
+		want     time.Duration
+	}{
+		{name: "no cooldown set", cooldown: 0, want: halfOpenProbeFloor},
+		{name: "floor wins for a short cooldown", cooldown: 30 * time.Second, want: halfOpenProbeFloor},
+		{name: "floor wins at two minutes", cooldown: 2 * time.Minute, want: halfOpenProbeFloor},
+		{name: "eight minutes", cooldown: 8 * time.Minute, want: 2 * time.Minute},
+		{name: "saturated at the cap", cooldown: 30 * time.Minute, want: 7*time.Minute + 30*time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := halfOpenProbeInterval(int64(tc.cooldown)); got != tc.want {
+				t.Fatalf("halfOpenProbeInterval(%v): got %v, want %v", tc.cooldown, got, tc.want)
+			}
+		})
 	}
 }
