@@ -178,6 +178,18 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 		HealthMinSamplesForFilter: func() int {
 			return runtimeConfigSnapshot(a.runtimeCfg).HealthMinSamplesForFilter
 		},
+		StickyStrictRebindEnabled: func() bool {
+			return runtimeConfigSnapshot(a.runtimeCfg).StickyStrictRebindEnabled
+		},
+		StickyStrictThresholdPercent: func() int {
+			return runtimeConfigSnapshot(a.runtimeCfg).StickyStrictThresholdPercent
+		},
+		StickyStrictFallbackPercent: func() int {
+			return runtimeConfigSnapshot(a.runtimeCfg).StickyStrictFallbackPercent
+		},
+		StickyStrictCooldown: func() time.Duration {
+			return time.Duration(runtimeConfigSnapshot(a.runtimeCfg).StickyStrictCooldown)
+		},
 		NodeTagResolver: a.topoRuntime.pool.ResolveNodeDisplayTag,
 		// Lease events are emitted synchronously on routing paths.
 		// Keep this callback lightweight and non-blocking.

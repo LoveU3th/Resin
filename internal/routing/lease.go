@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // Lease represents a sticky routing lease.
@@ -17,6 +17,25 @@ type Lease struct {
 	CreatedAtNs    int64
 	ExpiryNs       int64
 	LastAccessedNs int64
+
+	// NeedsRebind marks a lease whose node could not be reached, so the next
+	// request for this account moves it into the strict pool instead of being
+	// served by the same node again. StrictUntilNs bounds how long the mark is
+	// acted on, which is what stops an account whose pool has no eligible node
+	// from re-scanning on every single request.
+	//
+	// Both are in-memory only: ReadLease and UpsertLease map model.Lease field
+	// by field, so a restart deliberately forgets them along with the health
+	// state they are derived from.
+	NeedsRebind   bool
+	StrictUntilNs int64
+}
+
+// NeedsStrictRebind reports whether the lease should be moved before it is
+// served again. The deadline is stored rather than a plain boolean so a failed
+// rebind leaves the mark armed but inert until the cooldown elapses.
+func (l Lease) NeedsStrictRebind(nowNs int64) bool {
+	return l.NeedsRebind && nowNs < l.StrictUntilNs
 }
 
 // LeaseTable manages per-account sticky leases for a single platform.

@@ -93,6 +93,10 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"circuit_max_cooldown":                     true,
 	"health_recovery_floor_percent":            true,
 	"health_transfer_failure_weight_percent":   true,
+	"sticky_strict_rebind_enabled":             true,
+	"sticky_strict_threshold_percent":          true,
+	"sticky_strict_fallback_percent":           true,
+	"sticky_strict_cooldown":                   true,
 	"failover_enabled":                         true,
 	"failover_max_attempts":                    true,
 	"failover_attempt_budget":                  true,
@@ -252,6 +256,25 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.HealthTransferFailureWeightPercent < 0 || cfg.HealthTransferFailureWeightPercent > 100 {
 		return invalidArg("health_transfer_failure_weight_percent: must be between 0 and 100")
+	}
+	if cfg.StickyStrictThresholdPercent < 0 || cfg.StickyStrictThresholdPercent > 100 {
+		return invalidArg("sticky_strict_threshold_percent: must be between 0 and 100")
+	}
+	if cfg.StickyStrictFallbackPercent < 0 || cfg.StickyStrictFallbackPercent > 100 {
+		return invalidArg("sticky_strict_fallback_percent: must be between 0 and 100")
+	}
+	// The second tier only means anything below the first: a higher fallback
+	// would be a stricter pool consulted after a looser one already failed.
+	if cfg.StickyStrictFallbackPercent > cfg.StickyStrictThresholdPercent {
+		return invalidArg("sticky_strict_fallback_percent must not exceed sticky_strict_threshold_percent")
+	}
+	// The cooldown must be positive: the deadline is what keeps an account
+	// whose pool has nothing eligible from re-scanning on every request, and
+	// there is no way to express "no cooldown" without also meaning "rebind on
+	// every request". Disabling the feature is what
+	// sticky_strict_rebind_enabled is for.
+	if cfg.StickyStrictCooldown <= 0 {
+		return invalidArg("sticky_strict_cooldown: must be positive")
 	}
 	if cfg.FailoverMaxAttempts < 1 {
 		return invalidArg("failover_max_attempts: must be at least 1 (1 means no retry)")

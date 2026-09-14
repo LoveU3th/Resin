@@ -110,6 +110,9 @@ func prepareConnectTunnel(
 			}
 		},
 		OnAttempt: func(res routing.RouteResult, verdict attemptVerdict) {
+			// Independent of health recording: a lease must still be moved off
+			// an unreachable node when passive health feedback is switched off.
+			markStickyRebind(deps.router, account, res, verdict)
 			if deps.health == nil {
 				return
 			}

@@ -9,7 +9,7 @@ import "time"
 // A config written before this mechanism existed has no schema_version key and
 // reads back as 0, which is exactly what a config written by an old release
 // looks like — so 0 means "predates versioning" rather than "version 0".
-const RuntimeConfigSchemaVersion = 1
+const RuntimeConfigSchemaVersion = 2
 
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
@@ -69,6 +69,27 @@ type RuntimeConfig struct {
 	// The node was reached in that case, so the fault may not be its own.
 	// 100 weights both the same; 0 ignores transfer failures.
 	HealthTransferFailureWeightPercent int `json:"health_transfer_failure_weight_percent"`
+
+	// Sticky strict rebind: a sticky lease whose node could not be reached is
+	// rebound into the healthy pool on the account's next request, instead of
+	// only borrowing another node for that one request (DESIGN.md §粘性租约).
+	StickyStrictRebindEnabled bool `json:"sticky_strict_rebind_enabled"`
+	// StickyStrictThresholdPercent is the health a node must reach to be a
+	// rebind candidate, as a percentage. Unlike HealthFilterThresholdPercent
+	// this is a hard requirement and an unmeasured node never qualifies: a
+	// node with no track record cannot be called healthy, and treating it as
+	// healthy is what keeps never-measured nodes in the rotation.
+	StickyStrictThresholdPercent int `json:"sticky_strict_threshold_percent"`
+	// StickyStrictFallbackPercent is the second tier, consulted when no node
+	// meets StickyStrictThresholdPercent. 0 fills it with a tier below the
+	// primary threshold. When this tier is empty too, the rebind falls back to
+	// the whole routable view rather than leaving the account pinned.
+	StickyStrictFallbackPercent int `json:"sticky_strict_fallback_percent"`
+	// StickyStrictCooldown is how long an account keeps rebinding into the
+	// strict pool after a failed attempt on its lease node. It bounds how fast
+	// a flapping lease can move between nodes.
+	StickyStrictCooldown Duration `json:"sticky_strict_cooldown"`
+
 	// Request-level failover: retry a request on another node when the request
 	// provably never reached the first one. Never retried once any byte of the
 	// request has been written, so non-idempotent requests cannot be duplicated.
@@ -117,8 +138,15 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		CircuitMaxCooldown:                 Duration(30 * time.Minute),
 		HealthRecoveryFloorPercent:         60,
 		HealthTransferFailureWeightPercent: 50,
-		FailoverEnabled:                    true,
-		FailoverMaxAttempts:                2,
+		StickyStrictRebindEnabled:          true,
+		StickyStrictThresholdPercent:       85,
+		// The second tier exists because a strict threshold can be met by only
+		// a handful of nodes; without it, a poor pool would send every rebind
+		// straight to the last tier.
+		StickyStrictFallbackPercent: 70,
+		StickyStrictCooldown:        Duration(5 * time.Minute),
+		FailoverEnabled:             true,
+		FailoverMaxAttempts:         2,
 		// The attempt budget must not be shorter than ResponseHeaderTimeout, or
 		// a slow-but-healthy origin would be abandoned before it could answer.
 		FailoverAttemptBudget:           Duration(60 * time.Second),
@@ -232,6 +260,21 @@ func applyRuntimeConfigMigrations(cfg *RuntimeConfig) bool {
 			cfg.FailoverMaxAttempts = defaults.FailoverMaxAttempts
 			cfg.FailoverAttemptBudget = defaults.FailoverAttemptBudget
 			cfg.FailoverTotalBudget = defaults.FailoverTotalBudget
+		}
+	}
+
+	if cfg.SchemaVersion < 2 {
+		// v2: sticky strict rebind.
+		//
+		// Keyed off the threshold for the same reason failover keys off
+		// MaxAttempts: the two booleans here cannot tell "predates the feature"
+		// from "deliberately switched off", and the threshold is validated to a
+		// non-zero range, so a zero can only mean "never configured".
+		if cfg.StickyStrictThresholdPercent <= 0 {
+			cfg.StickyStrictRebindEnabled = defaults.StickyStrictRebindEnabled
+			cfg.StickyStrictThresholdPercent = defaults.StickyStrictThresholdPercent
+			cfg.StickyStrictFallbackPercent = defaults.StickyStrictFallbackPercent
+			cfg.StickyStrictCooldown = defaults.StickyStrictCooldown
 		}
 	}
 

@@ -459,6 +459,9 @@ func (p *ForwardProxy) forwardViaNodes(
 			}
 		},
 		OnAttempt: func(res routing.RouteResult, verdict attemptVerdict) {
+			// Independent of health recording: a lease must still be moved off
+			// an unreachable node when passive health feedback is switched off.
+			markStickyRebind(p.router, account, res, verdict)
 			if p.health == nil {
 				return
 			}

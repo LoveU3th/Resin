@@ -38,6 +38,11 @@ type Router struct {
 	healthPenaltyMs              func() int
 	healthFilterThresholdPercent func() int
 	healthMinSamplesForFilter    func() int
+	// Sticky strict rebind tuning, all optional: nil leaves the behaviour off.
+	stickyStrictRebindEnabled    func() bool
+	stickyStrictThresholdPercent func() int
+	stickyStrictFallbackPercent  func() int
+	stickyStrictCooldown         func() time.Duration
 }
 
 type RouterConfig struct {
@@ -54,6 +59,13 @@ type RouterConfig struct {
 	HealthPenaltyMs              func() int
 	HealthFilterThresholdPercent func() int
 	HealthMinSamplesForFilter    func() int
+	// Sticky strict rebind: moves a lease whose node failed to connect into the
+	// healthy pool on the account's next request. All optional; nil leaves the
+	// behaviour off.
+	StickyStrictRebindEnabled    func() bool
+	StickyStrictThresholdPercent func() int
+	StickyStrictFallbackPercent  func() int
+	StickyStrictCooldown         func() time.Duration
 }
 
 func NewRouter(cfg RouterConfig) *Router {
@@ -67,6 +79,10 @@ func NewRouter(cfg RouterConfig) *Router {
 		healthPenaltyMs:              cfg.HealthPenaltyMs,
 		healthFilterThresholdPercent: cfg.HealthFilterThresholdPercent,
 		healthMinSamplesForFilter:    cfg.HealthMinSamplesForFilter,
+		stickyStrictRebindEnabled:    cfg.StickyStrictRebindEnabled,
+		stickyStrictThresholdPercent: cfg.StickyStrictThresholdPercent,
+		stickyStrictFallbackPercent:  cfg.StickyStrictFallbackPercent,
+		stickyStrictCooldown:         cfg.StickyStrictCooldown,
 	}
 }
 
@@ -85,6 +101,40 @@ func (r *Router) healthWeights() HealthWeights {
 		w.MinSamplesForFilter = r.healthMinSamplesForFilter()
 	}
 	return w
+}
+
+// stickyStrict reads the current strict-pool tuning used when a lease has to be
+// moved off a node that failed to connect.
+//
+// The sample requirement is taken from the health filter setting on purpose:
+// both answer "how many observations before this score means something", and
+// having two knobs for one notion would only invite them to disagree.
+func (r *Router) stickyStrict() StrictPolicy {
+	var p StrictPolicy
+	if r.stickyStrictThresholdPercent != nil {
+		p.ThresholdPercent = r.stickyStrictThresholdPercent()
+	}
+	if r.stickyStrictFallbackPercent != nil {
+		p.FallbackPercent = r.stickyStrictFallbackPercent()
+	}
+	if r.healthMinSamplesForFilter != nil {
+		p.MinSamples = r.healthMinSamplesForFilter()
+	}
+	return p
+}
+
+// stickyRebindEnabled reports whether a failed attempt on a lease node should
+// arm a rebind. An unconfigured router leaves it off, like the health tuning.
+func (r *Router) stickyRebindEnabled() bool {
+	return r.stickyStrictRebindEnabled != nil && r.stickyStrictRebindEnabled()
+}
+
+// stickyCooldownNs is how long an armed rebind stays active.
+func (r *Router) stickyCooldownNs() int64 {
+	if r.stickyStrictCooldown == nil {
+		return 0
+	}
+	return int64(r.stickyStrictCooldown())
 }
 
 type RouteResult struct {
@@ -252,6 +302,23 @@ func (r *Router) decideStickyLease(
 	if loaded {
 		excluded := containsHash(exclude, current.NodeHash)
 
+		// A lease whose node could not be reached is moved into the strict pool
+		// before it is served again, so the account stops going back to a node
+		// that is known to be unreachable. Only on a fresh request: during a
+		// retry the lease is deliberately left alone (see the borrow branch
+		// below), and moving it mid-request would relocate the account's egress
+		// IP for a failure this request has already worked around.
+		if !excluded && current.NeedsStrictRebind(nowNs) {
+			if rebound, reboundResult, ok := r.rebindLease(
+				plat, state, account, targetDomain, nowNs, current, exclude,
+			); ok {
+				return rebound, xsync.UpdateOp, reboundResult, nil
+			}
+			// Nothing eligible: keep the mark and serve the lease anyway. The
+			// deadline is what stops a pool with no healthy node from being
+			// rescanned on every single request.
+		}
+
 		// A node whose own score says it is failing must not be handed out on a
 		// lease hit — but the account must not be relocated either, so this
 		// request borrows another node. Checked before the hit is recorded on
@@ -402,6 +469,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		r.authorities(),
 		r.p2cWindow(),
 		exclude,
+		nil,
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -502,6 +570,127 @@ func (r *Router) emitLeaseEvent(event LeaseEvent) {
 	}
 }
 
+// MarkStickyNodeFailure records that a request could not be served because the
+// node backing an account's sticky lease could not be reached. The account's
+// next request then moves that lease into the strict pool instead of being
+// served by the same node again.
+//
+// The failed hash is part of the check on purpose: a request that failed on a
+// borrowed node leaves the lease alone, because the lease node is not the one
+// that failed. Returns true when a lease was actually marked.
+func (r *Router) MarkStickyNodeFailure(platformID, account string, failed node.Hash) bool {
+	if account == "" || platformID == "" || !r.stickyRebindEnabled() {
+		return false
+	}
+	cooldown := r.stickyCooldownNs()
+	if cooldown <= 0 {
+		return false
+	}
+	state, ok := r.states.Load(platformID)
+	if !ok || state == nil {
+		return false
+	}
+
+	deadline := time.Now().UnixNano() + cooldown
+	marked := false
+	state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		if !loaded || current.NodeHash != failed {
+			return current, xsync.CancelOp
+		}
+		current.NeedsRebind = true
+		current.StrictUntilNs = deadline
+		marked = true
+		return current, xsync.UpdateOp
+	})
+	return marked
+}
+
+// rebindLease moves a lease onto a node from the strict pool. It reports
+// whether the lease was moved; false means no eligible node exists, and the
+// caller keeps serving the current one rather than failing the request.
+//
+// The lease's own node is always excluded, so a rebind can never land back on
+// the node that just failed.
+func (r *Router) rebindLease(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	account string,
+	targetDomain string,
+	nowNs int64,
+	current Lease,
+	exclude []node.Hash,
+) (Lease, RouteResult, bool) {
+	// Copy rather than append: exclude belongs to the caller and is appended to
+	// across attempts of one request.
+	avoid := make([]node.Hash, 0, len(exclude)+1)
+	avoid = append(avoid, exclude...)
+	avoid = append(avoid, current.NodeHash)
+
+	// A healthy node on the same egress IP keeps the address the site already
+	// knows, which matters most when a rebind is part of a bulk migration.
+	strict := r.stickyStrict()
+	if h, ok := chooseSameIPRotationCandidate(
+		plat,
+		r.pool,
+		current.EgressIP,
+		targetDomain,
+		r.authorities(),
+		r.p2cWindow(),
+		avoid,
+		strictEligibility(strict),
+	); ok {
+		if entry, found := r.pool.GetEntry(h); found {
+			return r.landRebind(plat, state, account, current, h, entry, nowNs)
+		}
+	}
+
+	h, entry, err := r.selectLiveStrictRoute(plat, state.IPLoadStats, targetDomain, avoid)
+	if err != nil {
+		return Lease{}, RouteResult{}, false
+	}
+	return r.landRebind(plat, state, account, current, h, entry, nowNs)
+}
+
+// landRebind writes the moved lease. The original window is kept: moving a
+// lease must not extend how long the account stays pinned to one address.
+func (r *Router) landRebind(
+	plat *platform.Platform,
+	state *PlatformRoutingState,
+	account string,
+	current Lease,
+	h node.Hash,
+	entry *node.NodeEntry,
+	nowNs int64,
+) (Lease, RouteResult, bool) {
+	egressIP := entry.GetEgressIP()
+	// The per-IP lease count follows the address, not the node: a move between
+	// two nodes that share an address leaves the count untouched.
+	if egressIP != current.EgressIP {
+		state.Leases.stats.Dec(current.EgressIP)
+		state.Leases.stats.Inc(egressIP)
+	}
+
+	next := current
+	next.NodeHash = h
+	next.EgressIP = egressIP
+	next.LastAccessedNs = nowNs
+	next.NeedsRebind = false
+	next.StrictUntilNs = 0
+
+	r.emitLeaseEvent(LeaseEvent{
+		Type:        LeaseReplace,
+		PlatformID:  plat.ID,
+		Account:     account,
+		NodeHash:    next.NodeHash,
+		EgressIP:    next.EgressIP,
+		CreatedAtNs: next.CreatedAtNs,
+	})
+	return next, RouteResult{
+		NodeHash: next.NodeHash,
+		EgressIP: next.EgressIP,
+	}, true
+}
+
 func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
@@ -526,6 +715,12 @@ func (r *Router) selectLiveRandomRoute(
 	return node.Zero, nil, ErrNoAvailableNodes
 }
 
+// chooseSameIPRotationCandidate returns a node that shares targetIP and is not
+// excluded, preferring the one with the best recent latency for the target.
+//
+// eligible, when non-nil, additionally filters candidates. Callers that rotate
+// within a platform pass nil; a rebind passes the strict-pool predicate so the
+// same-address preference never overrides the health requirement.
 func chooseSameIPRotationCandidate(
 	plat *platform.Platform,
 	pool PoolAccessor,
@@ -534,6 +729,7 @@ func chooseSameIPRotationCandidate(
 	authorities []string,
 	window time.Duration,
 	exclude []node.Hash,
+	eligible func(*node.NodeEntry) bool,
 ) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
@@ -542,6 +738,9 @@ func chooseSameIPRotationCandidate(
 	plat.View().Range(func(h node.Hash) bool {
 		entry, ok := pool.GetEntry(h)
 		if !ok || entry.GetEgressIP() != targetIP || containsHash(exclude, h) {
+			return true
+		}
+		if eligible != nil && !eligible(entry) {
 			return true
 		}
 		if fallbackHash == node.Zero {
@@ -799,6 +998,7 @@ func (r *Router) borrowRoute(
 		r.authorities(),
 		r.p2cWindow(),
 		exclude,
+		nil,
 	); ok {
 		if entry, found := r.pool.GetEntry(h); found {
 			return RouteResult{

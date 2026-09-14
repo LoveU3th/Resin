@@ -471,3 +471,51 @@ func TestPatchRuntimeConfig_LatencyTestURLAutoAddsAuthority(t *testing.T) {
 		t.Fatalf("expected gstatic.com to be auto-added, got %v", updated.LatencyAuthorities)
 	}
 }
+
+// The strict rebind settings are patchable and validated. The tiers must be
+// ordered — a fallback above the primary threshold would be a stricter pool
+// consulted after a looser one already failed — and the cooldown must be
+// positive, because a zero deadline would mean "rebind on every request"
+// rather than "off". Turning the feature off is what the switch is for.
+func TestPatchRuntimeConfig_StickyStrictValidation(t *testing.T) {
+	h := newPatchHarness(t)
+
+	updated, err := h.cp.PatchRuntimeConfig([]byte(`{
+		"sticky_strict_threshold_percent": 80,
+		"sticky_strict_fallback_percent": 50,
+		"sticky_strict_cooldown": "90s"
+	}`))
+	if err != nil {
+		t.Fatalf("expected a valid patch to apply: %v", err)
+	}
+	if updated.StickyStrictThresholdPercent != 80 || updated.StickyStrictFallbackPercent != 50 {
+		t.Fatalf("patch not applied: threshold %d, fallback %d",
+			updated.StickyStrictThresholdPercent, updated.StickyStrictFallbackPercent)
+	}
+	if time.Duration(updated.StickyStrictCooldown) != 90*time.Second {
+		t.Fatalf("cooldown: got %v, want 1m30s", time.Duration(updated.StickyStrictCooldown))
+	}
+
+	if _, err := h.cp.PatchRuntimeConfig([]byte(`{
+		"sticky_strict_threshold_percent": 50,
+		"sticky_strict_fallback_percent": 80
+	}`)); err == nil {
+		t.Fatal("expected an inverted tier pair to be rejected")
+	}
+
+	if _, err := h.cp.PatchRuntimeConfig([]byte(`{"sticky_strict_cooldown":"0s"}`)); err == nil {
+		t.Fatal("expected a zero cooldown to be rejected")
+	}
+
+	if _, err := h.cp.PatchRuntimeConfig([]byte(`{"sticky_strict_threshold_percent":101}`)); err == nil {
+		t.Fatal("expected a threshold above 100 to be rejected")
+	}
+
+	off, err := h.cp.PatchRuntimeConfig([]byte(`{"sticky_strict_rebind_enabled": false}`))
+	if err != nil {
+		t.Fatalf("expected the switch to be patchable: %v", err)
+	}
+	if off.StickyStrictRebindEnabled {
+		t.Fatal("the switch did not take effect")
+	}
+}
