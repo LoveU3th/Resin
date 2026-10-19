@@ -360,7 +360,7 @@ func (m *ProbeManager) ProbeEgressSync(hash node.Hash) (*EgressProbeResult, erro
 		m.onProbeEvent("egress")
 	}
 
-	ip, stage, err := m.performEgressProbe(hash)
+	ip, stage, err := m.performEgressProbe(hash, entry)
 	if err != nil {
 		if stage == egressProbeParseError {
 			return nil, fmt.Errorf("parse egress IP: %w", err)
@@ -457,13 +457,11 @@ func (m *ProbeManager) scanEgress() {
 			return true // skip nil outbound
 		}
 
-		// Check if due: lastAttempt + interval - lookahead <= now.
-		lastCheck := entry.LastEgressUpdateAttempt.Load()
-		if lastCheck > 0 {
-			nextDue := time.Unix(0, lastCheck).Add(interval).Add(-lookahead)
-			if now.Before(nextDue) {
-				return true // not yet due
-			}
+		// Check if due. A node that has never sampled its egress IP cannot be
+		// routed, so it is retried on a short backing-off interval rather than
+		// the refresh interval — see egressProbeDue.
+		if !m.egressProbeDue(entry, now, interval, lookahead) {
+			return true // not yet due
 		}
 
 		m.enqueueProbe(h, probeTaskKindEgress, probePriorityNormal)
@@ -497,6 +495,91 @@ func halfOpenProbeInterval(circuitCooldownNs int64) time.Duration {
 		return interval
 	}
 	return halfOpenProbeFloor
+}
+
+const (
+	// egressUnknownIPRetryBase is the retry interval for a node that has never
+	// produced a successful egress sample.
+	//
+	// Such a node cannot be routed at all — a platform view requires a known
+	// egress IP — so gating its retry behind MaxEgressTestInterval (a day by
+	// default) means one failed first probe parks the node for a day, even
+	// after its latency probes have proven the node itself works. A short
+	// interval brings it back into rotation within minutes.
+	egressUnknownIPRetryBase = 3 * time.Minute
+	// egressRetryBackoffShiftLimit caps the 2^n growth of the unknown-IP
+	// backoff, so a node that can never sample its egress (a probe target the
+	// node's network cannot reach, say) decays to the refresh interval instead
+	// of being probed forever.
+	egressRetryBackoffShiftLimit = 10
+)
+
+// egressUnknownRetryInterval backs off the retry of a node that has never
+// produced an egress sample: 3m, 6m, 12m ... capped at maxInterval (the
+// configured MaxEgressTestInterval). streak is the node's consecutive
+// egress-probe failure count.
+func egressUnknownRetryInterval(streak int32, maxInterval time.Duration) time.Duration {
+	interval := egressUnknownIPRetryBase
+	for i := int32(0); i < streak-1 && i < egressRetryBackoffShiftLimit; i++ {
+		interval *= 2
+		if interval >= maxInterval {
+			return maxInterval
+		}
+	}
+	if interval > maxInterval {
+		return maxInterval
+	}
+	return interval
+}
+
+// egressProbeDue reports whether a node's egress probe is due at now.
+//
+// Three regimes, in order:
+//
+//   - Never attempted: due immediately, so a new node is measured at once.
+//   - No successful sample yet: the node cannot be routed, so it is retried on
+//     a short, backing-off interval. While its breaker is half-open it is
+//     already being probed for recovery, and recovery needs the egress IP, so
+//     the recovery spacing applies instead of the backoff.
+//   - Otherwise: the normal refresh interval (MaxEgressTestInterval).
+//
+// The half-open bypass deliberately covers only nodes without a sample. A node
+// that already has one rejoins routing on its recorded IP — refreshing it is
+// the periodic probe's job, not the recovery probe's — and probing every node
+// in a recovery window on the short spacing would double the load a chronic
+// fleet puts on the probe workers.
+func (m *ProbeManager) egressProbeDue(
+	entry *node.NodeEntry,
+	now time.Time,
+	maxInterval, lookahead time.Duration,
+) bool {
+	lastAttempt := entry.LastEgressUpdateAttempt.Load()
+	if lastAttempt == 0 {
+		return true
+	}
+	elapsed := now.Sub(time.Unix(0, lastAttempt))
+
+	if entry.LastEgressUpdate.Load() == 0 {
+		if entry.IsHalfOpen() {
+			return elapsed >= halfOpenProbeInterval(entry.CircuitCooldownNs.Load())
+		}
+		return elapsed+lookahead >= egressUnknownRetryInterval(entry.EgressFailStreak(), maxInterval)
+	}
+
+	return elapsed+lookahead >= maxInterval
+}
+
+// probeFailureStage attributes a failed fetch to a request phase.
+//
+// A positive latency means the fetcher saw the target answering — the
+// handshake or the first response byte arrived through the node — so the node
+// proxied a connection and the failure lies beyond it: transfer. Zero latency
+// means the node was never reached: connect.
+func probeFailureStage(latency time.Duration) string {
+	if latency > 0 {
+		return node.PassiveStageTransfer
+	}
+	return node.PassiveStageConnect
 }
 
 // scanLatency iterates all pool nodes and probes those due for latency check.
@@ -796,7 +879,7 @@ func (m *ProbeManager) probeEgress(hash node.Hash, entry *node.NodeEntry) {
 		m.onProbeEvent("egress")
 	}
 
-	_, stage, err := m.performEgressProbe(hash)
+	_, stage, err := m.performEgressProbe(hash, entry)
 	if err != nil {
 		if stage == egressProbeParseError {
 			log.Printf("[probe] parse egress IP for %s: %v", hash.Hex(), err)
@@ -829,15 +912,20 @@ func (m *ProbeManager) probeLatency(hash node.Hash, entry *node.NodeEntry, testU
 	}
 }
 
-func (m *ProbeManager) performEgressProbe(hash node.Hash) (netip.Addr, egressProbeErrorStage, error) {
+func (m *ProbeManager) performEgressProbe(hash node.Hash, entry *node.NodeEntry) (netip.Addr, egressProbeErrorStage, error) {
 	body, latency, err := m.fetcher(hash, egressTraceURL)
 	if err != nil {
-		m.pool.RecordResult(hash, false)
+		// Attribute the failure to the phase it happened in: a fetch that got
+		// as far as seeing the target answer says the node proxied a
+		// connection, so it must not be evicted on that evidence alone.
+		m.pool.RecordProbeStageResult(hash, probeFailureStage(latency), false)
+		entry.RecordEgressProbeResult(false)
 		m.pool.UpdateNodeEgressIP(hash, nil, nil)
 		return netip.Addr{}, egressProbeFetchError, err
 	}
 
-	m.pool.RecordResult(hash, true)
+	m.pool.RecordProbeResult(hash, true)
+	entry.RecordEgressProbeResult(true)
 	if latency > 0 {
 		m.pool.RecordLatency(hash, egressTraceDomain, &latency)
 	}
@@ -855,12 +943,12 @@ func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error
 	domain := netutil.ExtractDomain(testURL)
 	_, latency, err := m.fetcher(hash, testURL)
 	if err != nil {
-		m.pool.RecordResult(hash, false)
+		m.pool.RecordProbeStageResult(hash, probeFailureStage(latency), false)
 		m.pool.RecordLatency(hash, domain, nil)
 		return err
 	}
 
-	m.pool.RecordResult(hash, true)
+	m.pool.RecordProbeResult(hash, true)
 	m.pool.RecordLatency(hash, domain, &latency)
 	return nil
 }

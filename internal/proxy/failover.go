@@ -158,6 +158,16 @@ type FailoverConfig struct {
 	Enabled bool
 	// MaxAttempts counts the initial attempt, so 1 means "no retry".
 	MaxAttempts int
+	// ConnectFailureExtraAttempts raises the attempt cap while every failure so
+	// far was a connect-stage failure — the request provably never reached any
+	// upstream, so trying more nodes cannot duplicate a side effect.
+	//
+	// It exists for pools where nodes fail to connect often: a fixed
+	// MaxAttempts sized for a healthy pool gives up while nodes that would have
+	// worked were never tried. It only ever widens the cap for failures that
+	// are already safe to retry, and the total budget still bounds everything.
+	// 0 disables the escalation.
+	ConnectFailureExtraAttempts int
 	// AttemptBudget bounds a single attempt. Reaching it abandons that attempt
 	// and moves on; the abandoned attempt keeps running in the background under
 	// its own dial and response-header timeouts.
@@ -171,9 +181,16 @@ type FailoverConfig struct {
 func (c FailoverConfig) effective() FailoverConfig {
 	if !c.Enabled || c.MaxAttempts <= 1 {
 		c.MaxAttempts = 1
+		// Retrying is off, so escalating the cap is off with it: an operator
+		// who asked for a single attempt must not get more because the first
+		// one failed to connect.
+		c.ConnectFailureExtraAttempts = 0
 	}
 	if c.MaxAttempts < 1 {
 		c.MaxAttempts = 1
+	}
+	if c.ConnectFailureExtraAttempts < 0 {
+		c.ConnectFailureExtraAttempts = 0
 	}
 	return c
 }
@@ -181,6 +198,20 @@ func (c FailoverConfig) effective() FailoverConfig {
 func (c FailoverConfig) maxAttempts() int {
 	cfg := c.effective()
 	return cfg.MaxAttempts
+}
+
+// escalatedMaxAttempts is the cap for the next attempt: the configured cap,
+// widened while every failure so far was a connect-stage failure (nothing was
+// ever sent, so more attempts are safe). connectOnlyFailures is false as soon
+// as one attempt fails any other way — a slow origin or a reset after bytes
+// went out ends the escalation, because at that point the extra attempts buy
+// safety the request has already spent.
+func (c FailoverConfig) escalatedMaxAttempts(connectOnlyFailures bool) int {
+	cfg := c.effective()
+	if !connectOnlyFailures {
+		return cfg.MaxAttempts
+	}
+	return cfg.MaxAttempts + cfg.ConnectFailureExtraAttempts
 }
 
 // FailoverParams drives runFailover.
@@ -224,16 +255,16 @@ type FailoverResult[T any] struct {
 	Abandoned bool
 }
 
-// runFailover tries a request on up to MaxAttempts distinct nodes, retrying only
-// when the request provably did not reach the upstream.
+// runFailover tries a request on up to MaxAttempts distinct nodes — more while
+// every failure is a connect-stage one, see
+// FailoverConfig.ConnectFailureExtraAttempts — retrying only when the request
+// provably did not reach the upstream.
 //
 // The budget is enforced by abandoning an attempt rather than by cancelling the
 // request context: the context is inherited by the response body, so putting a
 // deadline on it would cut off streaming responses and long downloads. An
 // abandoned attempt keeps running in the background and its result is discarded.
 func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult[T] {
-	maxAttempts := p.Config.maxAttempts()
-
 	var (
 		exclude     []node.Hash
 		failedNodes []node.Hash
@@ -246,12 +277,23 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 
 	startedAt := time.Now()
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		attempts = attempt + 1
+	// connectOnly tracks whether every failure so far was a connect-stage
+	// failure: the request never reached an upstream, so it is safe to try more
+	// nodes than MaxAttempts alone allows (see
+	// FailoverConfig.ConnectFailureExtraAttempts). One failure of any other
+	// kind clears it for the rest of the request.
+	connectOnly := true
 
+	// The loop bound is the escalated cap, re-read every iteration: it widens
+	// only while every failure so far was a connect-stage failure.
+	for attempt := 0; attempt < p.Config.escalatedMaxAttempts(connectOnly); attempt++ {
+		// The budget is checked before the attempt is counted: a request the
+		// budget cut short made fewer attempts than iterations, and the count
+		// is what the request log reports.
 		if p.Config.TotalBudget > 0 && time.Since(startedAt) >= p.Config.TotalBudget {
 			break
 		}
+		attempts = attempt + 1
 
 		routed, routeErr := p.Resolve(exclude)
 		if routeErr != nil {
@@ -309,10 +351,12 @@ func runFailover[T any](ctx context.Context, p FailoverParams[T]) FailoverResult
 		exclude = append(exclude, routed.Route.NodeHash)
 		failedNodes = append(failedNodes, routed.Route.NodeHash)
 
-		if !verdict.retryable {
-			break
+		// A failure that is not provably pre-upstream ends the escalation: the
+		// extra attempts are only justified while nothing has been sent.
+		if !verdict.retryable || verdict.stage != node.PassiveStageConnect {
+			connectOnly = false
 		}
-		if attempt+1 >= maxAttempts {
+		if !verdict.retryable {
 			break
 		}
 	}

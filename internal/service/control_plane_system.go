@@ -99,6 +99,7 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"sticky_strict_cooldown":                   true,
 	"failover_enabled":                         true,
 	"failover_max_attempts":                    true,
+	"failover_connect_extra_attempts":          true,
 	"failover_attempt_budget":                  true,
 	"failover_total_budget":                    true,
 	"max_latency_test_interval":                true,
@@ -278,6 +279,9 @@ func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
 	}
 	if cfg.FailoverMaxAttempts < 1 {
 		return invalidArg("failover_max_attempts: must be at least 1 (1 means no retry)")
+	}
+	if cfg.FailoverConnectExtraAttempts < 0 {
+		return invalidArg("failover_connect_extra_attempts: must be non-negative (0 keeps the cap at failover_max_attempts)")
 	}
 	if cfg.FailoverAttemptBudget < 0 {
 		return invalidArg("failover_attempt_budget: must not be negative (0 disables it)")

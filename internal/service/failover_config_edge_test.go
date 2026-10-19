@@ -50,6 +50,12 @@ func TestFailoverConfigEdgeValues(t *testing.T) {
 		{"huge attempts accepted", func(c *config.RuntimeConfig) {
 			c.FailoverMaxAttempts = 100000
 		}, "ok"},
+		{"negative connect extra attempts rejected", func(c *config.RuntimeConfig) {
+			c.FailoverConnectExtraAttempts = -1
+		}, "failover_connect_extra_attempts"},
+		{"zero connect extra attempts accepted", func(c *config.RuntimeConfig) {
+			c.FailoverConnectExtraAttempts = 0
+		}, "ok"},
 	}
 
 	for _, tc := range cases {

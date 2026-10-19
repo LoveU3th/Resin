@@ -9,7 +9,7 @@ import "time"
 // A config written before this mechanism existed has no schema_version key and
 // reads back as 0, which is exactly what a config written by an old release
 // looks like — so 0 means "predates versioning" rather than "version 0".
-const RuntimeConfigSchemaVersion = 2
+const RuntimeConfigSchemaVersion = 3
 
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
@@ -96,6 +96,13 @@ type RuntimeConfig struct {
 	// FailoverMaxAttempts counts the first attempt, so 1 disables retrying.
 	FailoverEnabled     bool `json:"failover_enabled"`
 	FailoverMaxAttempts int  `json:"failover_max_attempts"`
+	// FailoverConnectExtraAttempts raises the attempt cap while every failure so
+	// far was a connect-stage failure — the request provably never reached any
+	// upstream, so trying further nodes cannot duplicate a side effect. It is
+	// the answer to a pool where nodes fail to connect often: a MaxAttempts
+	// sized for a healthy pool gives up while nodes that would have worked were
+	// never tried. 0 keeps the cap at FailoverMaxAttempts.
+	FailoverConnectExtraAttempts int `json:"failover_connect_extra_attempts"`
 	// FailoverAttemptBudget bounds one attempt; reaching it abandons that
 	// attempt and moves to the next node. FailoverTotalBudget bounds them all.
 	FailoverAttemptBudget Duration `json:"failover_attempt_budget"`
@@ -147,6 +154,10 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		StickyStrictCooldown:        Duration(5 * time.Minute),
 		FailoverEnabled:             true,
 		FailoverMaxAttempts:         2,
+		// A poor pool fails to connect often, and each such failure is provably
+		// pre-upstream, so two extra attempts buy real availability without any
+		// risk of duplicating a request. 0 restores the flat cap.
+		FailoverConnectExtraAttempts: 2,
 		// The attempt budget must not be shorter than ResponseHeaderTimeout, or
 		// a slow-but-healthy origin would be abandoned before it could answer.
 		FailoverAttemptBudget:           Duration(60 * time.Second),
@@ -275,6 +286,18 @@ func applyRuntimeConfigMigrations(cfg *RuntimeConfig) bool {
 			cfg.StickyStrictThresholdPercent = defaults.StickyStrictThresholdPercent
 			cfg.StickyStrictFallbackPercent = defaults.StickyStrictFallbackPercent
 			cfg.StickyStrictCooldown = defaults.StickyStrictCooldown
+		}
+	}
+
+	if cfg.SchemaVersion < 3 {
+		// v3: connect-failure escalation of the failover attempt cap.
+		//
+		// An old release cannot have written this field, so a zero here means
+		// "never set" rather than "deliberately off" — the same reasoning the v1
+		// block applies to its fields. A v3 config keeps whatever the operator
+		// chose, including 0.
+		if cfg.FailoverConnectExtraAttempts <= 0 {
+			cfg.FailoverConnectExtraAttempts = defaults.FailoverConnectExtraAttempts
 		}
 	}
 

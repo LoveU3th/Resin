@@ -411,12 +411,16 @@ Resin 使用计数器熔断机制保护系统稳定性。
 #### 出口探测
 * 目标：全局节点池所有节点。
 * 职责：定期刷新节点的出口 IP 与地区信息，确保路由策略（如同 IP 关联、地区过滤）的准确性。
-* 探测时机与调度策略：每隔 13～17 秒全局扫描一次。调度依据是 `LastEgressUpdateAttempt`：对未来 15 秒内将会或者已经超过 `MaxEgressTestInterval` 的节点进行探测。另外，新的节点加入全局节点池时，需要立即进行一次出口探测。
+* 探测时机与调度策略：每隔 13～17 秒全局扫描一次。调度依据是 `LastEgressUpdateAttempt`：
+	* 对未来 15 秒内将会或者已经超过 `MaxEgressTestInterval` 的节点进行探测（常规刷新）。
+	* 新的节点加入全局节点池时，需要立即进行一次出口探测。
+	* **从未取得过出口样本的节点按短间隔退避重试**：没有出口 IP 的节点不可能进入任何 Platform 的可路由视图（可路由视图要求出口 IP 已知），一次失败的首次探测不该让它空等一整个 `MaxEgressTestInterval`（默认 1 天）——哪怕它的延迟探测早已证明节点本身是通的。退避从 3 分钟起、每次失败翻倍、上限为 `MaxEgressTestInterval`，因此永远探不到出口的节点会自行衰减到常规刷新间隔，不会被反复热探（退避计数不持久化，重启后从基数重新开始，只意味着多探几次）。
+	* **半开节点的退避让位于恢复间距**：从未取得出口样本且熔断已进入半开的节点，按恢复间距（与延迟探测同一套「冷却/4、下限 30 秒」）探测——恢复本来就需要出口 IP。已有出口样本的半开节点不在此列：它凭记录中的 IP 就能重新入视图，刷新是常规探测的职责；让恢复窗口内的每个节点都按短间距探测，会让长期故障的机队把探测 worker 压满。
 * 探测动作：通过节点请求 `https://cloudflare.com/cdn-cgi/trace` (GET)。
 * 结果处理：
-	* 记录本次网络请求的结果。调用 `RecordResult(id, true/false)`。
+	* 记录本次网络请求的结果，并按失败发生的阶段分别记账（见「主动延迟探测」的同款规则）：连接阶段失败 `RecordResult(id, false)`，全额计入健康度并喂熔断器；传输阶段失败（已看到目标应答，latency 大于 0）只按 `HealthTransferFailureWeightPercent` 降权计入健康度，不喂熔断器。
   * 如果成功，作为副作用，会更新对 Cloudflare 的延迟统计，调用 `RecordLatency(id, "cloudflare.com", &latency)`。
-	* 无论成功或失败，都会调用 `UpdateNodeEgressIP` 记录尝试时间；成功时携带解析后的 `ip`，失败时传 `nil`。
+	* 无论成功或失败，都会调用 `UpdateNodeEgressIP` 记录尝试时间；成功时携带解析后的 `ip`，失败时传 `nil`。成功与失败同时决定退避计数：成功清零，失败递增（供上面的短间隔退避使用）。
 
 #### 主动延迟探测
 * 目标：全局节点池所有节点。
@@ -429,7 +433,9 @@ Resin 使用计数器熔断机制保护系统稳定性。
 * 成功判定：响应状态码必须属于 2xx。默认探测站点返回 204，故校验接受全部 2xx 而非仅 200；返回 502/503/407 一律记为探测失败。
 * 结果处理：
     * 成功：先调用 `RecordResult(true)`；调用 `RecordLatency(..., &latency)`（`latency<=0` 时仅记录尝试，不写样本）。
-    * 失败：调用 `RecordResult(false)` 与 `RecordLatency(..., nil)`。连续失败将导致节点熔断。
+    * 失败：调用 `RecordLatency(..., nil)`，并按失败发生的阶段分别记账：
+        * **连接阶段**（节点根本没被摸到，探测返回的 latency 为 0）：`RecordResult(false)`，全额计入健康度并喂熔断器——与分阶段之前的行为完全一致。
+        * **传输阶段**（探测已经通过节点看到目标在应答，latency 大于 0：例如目标返回 502/503、读 body 时连接被重置）：只按 `HealthTransferFailureWeightPercent` 降权计入健康度，**不喂熔断器**。节点已经代发了一个连接，失败发生在节点出口之外，据此熔断会摘掉仍在工作的容量；真实用户请求的失败仍会照常熔断（见被动探测），因此这不是盲区。
 
 #### 主动探测的并发控制
 ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型：
@@ -456,6 +462,7 @@ ProbeManager 采用 **双优先级队列 + 固定 worker 池** 的调度模型�
 * **慢与坏必须区分**（见「稳定性可观测」一节）：区分依据是**错误性质而非阶段**——
   同为 transfer 阶段，超时是慢、RST 是坏。慢失败降权计入健康度但**不进熔断**。
 * **有 body 的请求不重试**：服务端请求的 `GetBody` 恒为 nil，body 无法重放。因此重试实际只覆盖 GET/HEAD，POST/PUT 保持单次发送。这也是「页面打不开」最主要的表现场景。
+* **连接失败可升级重试次数**：当至今为止的每一次失败都是连接阶段失败（请求可证明没有到达任何上游）时，尝试上限在 `failover_max_attempts` 之上再放宽 `failover_connect_extra_attempts` 次（默认 2）。节点连不上的劣质池里，按健康池 sizing 的固定次数会在试到本来可用的节点之前就放弃；而连接阶段失败本来就是可以安全重试的那一类，放宽不会引入重复提交风险。出现任何一种非连接阶段失败（慢、被放弃、写字节后断开）时升级立即停止，回到固定上限；总预算仍然兜底。`failover_max_attempts=1` 或 failover 关闭时该升级同样关闭。
 * **bypass 流量不参与 failover**：它没有节点可换。
 
 ### 粘性租约与排除
@@ -629,7 +636,8 @@ Resin 内置了 GeoIP 服务，用于支持 Platform 的 RegionFilters 功能。
 若可路由集合大小 >= 2：
 3. 从 Platform 的可路由集合中随机挑选两个候选节点。
 4. 比较两个候选节点的**综合评分**，选择评分较低者。
-5. 我们信任 Platform 的可路由集合，不进行额外的节点可用性检查。当可路由集合大小为 0，路由失败，拒绝请求。
+5. **候选被健康过滤拒绝时的有界扫描**：两个随机候选都被过滤（已确认不健康）时，随机抽取很难找到合格的少数派——劣质池里多数节点不健康，多抽几次大概率还是抽到被拒绝的节点，请求于是拿到一个过滤已经否掉的节点。此时改为线性扫描可路由视图（上限 64 个候选，只收未被排除且通过过滤的节点），在合格候选内再做同样的两路比较。扫描不到任何合格候选时，照旧比较被拒绝的一对：健康度不能让路由失败。
+6. 我们信任 Platform 的可路由集合，不进行额外的节点可用性检查。当可路由集合大小为 0，路由失败，拒绝请求。
 
 #### 综合评分公式
 - **LeaseCount**：该节点出口 IP 在当前 Platform 被多少个活跃租约占用。从 IPLoadStats 获取。
@@ -2561,7 +2569,7 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 * 唯一取舍：在该机制出现之前就把某个新字段显式设为 0 的运维，会在升级时被补成默认值一次，重新设回 0 即可。
 * `schema_version` 是描述存储文档的内部字段，不可以通过 PATCH 修改。
 * `MaxConsecutiveFailures` 早于该机制，仍是无条件回填——它的 0 值表示熔断器永不触发，已无法区分"字段缺失"与"显式设为 0"。
-* 版本清单：**v1** 节点健康度与请求级 failover；**v2** 粘性租约严格池（`StickyStrict*`）。v2 以 `StickyStrictThresholdPercent` 作为「是否配置过」的哨兵，理由与 failover 用 `FailoverMaxAttempts` 相同：两个布尔开关无法区分「字段缺失」与「显式关闭」。
+* 版本清单：**v1** 节点健康度与请求级 failover；**v2** 粘性租约严格池（`StickyStrict*`）；**v3** 连接失败升级重试（`FailoverConnectExtraAttempts`）。v2 以 `StickyStrictThresholdPercent` 作为「是否配置过」的哨兵，理由与 failover 用 `FailoverMaxAttempts` 相同：两个布尔开关无法区分「字段缺失」与「显式关闭」。v3 同理：`FailoverConnectExtraAttempts` 的 0 既是合法值（关闭升级）又是零值，因此**只有 v3 之前的配置**读回的 0 会被补成默认值；v3 及以后的配置保留运维的选择，包括显式的 0。
 
 新增运行时配置项时：在 `internal/config/runtime.go` 里同时提高 `RuntimeConfigSchemaVersion`，并把新字段列入 `applyRuntimeConfigMigrations` 对应版本，再把字段名加入 `internal/service/control_plane_system.go` 的 `runtimeConfigAllowedFields`（若允许热更新）。
 

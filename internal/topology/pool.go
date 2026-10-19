@@ -580,6 +580,51 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 	}
 }
 
+// RecordProbeStageResult records an active probe result attributed to the
+// phase the failure happened in.
+//
+// A connect-phase result (or any success) is recorded in full: the node was
+// unreachable, which is strong evidence against it and feeds the breaker —
+// exactly what RecordResult does.
+//
+// A transfer-phase failure means the probe reached the target *through* the
+// node: a connection was proxied and a response started arriving. The node did
+// its job; the failure lies between the node's egress and the target (or with
+// the target itself). Such a result only lowers the health score, at the
+// reduced transfer weight, and never feeds the breaker — evicting a node that
+// demonstrably proxies traffic would remove capacity that works, which is the
+// opposite of what a breaker is for. Passive traffic still trips the breaker
+// for a node that keeps failing on real requests, so this is not a blind spot.
+//
+// This is the probe-side counterpart of RecordPassiveSlowFailure: both say
+// "the node was reached, so this says little about it".
+func (p *GlobalNodePool) RecordProbeResult(hash node.Hash, success bool) {
+	p.RecordProbeStageResult(hash, node.PassiveStageConnect, success)
+}
+
+func (p *GlobalNodePool) RecordProbeStageResult(hash node.Hash, stage string, success bool) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+
+	if success || stage == node.PassiveStageConnect {
+		dynamicChanged, circuitStateChanged := p.recordBreaker(entry, success)
+		if circuitStateChanged {
+			p.notifyAllPlatformsDirty(hash)
+		}
+		if dynamicChanged && p.onNodeDynamicChanged != nil {
+			p.onNodeDynamicChanged(hash)
+		}
+	}
+
+	weight := 1.0
+	if !success && stage == node.PassiveStageTransfer {
+		weight = p.currentTransferFailureWeight()
+	}
+	p.recordHealth(entry, success, weight)
+}
+
 // recordBreaker applies one result to the breaker only, leaving the health
 // score alone. Returns whether dynamic fields changed and whether the breaker
 // opened or closed.

@@ -17,6 +17,18 @@ var ErrNoAvailableNodes = errors.New("no available nodes")
 // unbounded scan.
 const healthFilterAttempts = 3
 
+// healthyScanCap bounds the view scan that looks for an acceptable candidate
+// when the random draws all landed on unhealthy nodes.
+//
+// The quick filter above draws a handful of extra candidates, which is enough
+// while the pool is mostly healthy. In a pool where most nodes are failing,
+// those draws keep landing on rejected nodes even though acceptable ones exist
+// — the request then gets a node the filter already said no to. A bounded scan
+// of the view fixes that without turning selection into a full sort: the cap
+// keeps the cost constant, and the scan only runs when the quick filter came
+// back empty-handed, so a healthy fleet never pays for it.
+const healthyScanCap = 64
+
 // HealthWeights controls how strongly node health affects routing.
 // A zero value disables health entirely, leaving scoring as it was before.
 type HealthWeights struct {
@@ -232,6 +244,20 @@ func randomRoute(
 	}
 	h2 = filter(h2, h1)
 
+	// The quick filter draws a few extra candidates and gives up quickly. When
+	// both picks are still rejected the pool is mostly unhealthy, and random
+	// draws are a bad way to find the acceptable minority: scan the view
+	// instead, bounded, and compare among what turns up. If nothing acceptable
+	// exists at all, fall through and compare the rejected pair as before —
+	// health must never turn a routable pool into a failed request.
+	if !health.allows(pool, h1) || !health.allows(pool, h2) {
+		if candidates := healthyCandidateScan(view, pool, exclude, health); len(candidates) > 0 {
+			return pickStrictCandidate(
+				candidates, rng, plat, stats, pool, targetDomain, authorities, p2cWindow, health,
+			), nil
+		}
+	}
+
 	// Determine effective latency for comparison.
 	lat1, lat2 := compareLatencies(h1, h2, pool, targetDomain, authorities, p2cWindow)
 
@@ -245,6 +271,34 @@ func randomRoute(
 		selected = h1
 	}
 	return selected, nil
+}
+
+// healthyCandidateScan collects up to healthyScanCap routable, non-excluded
+// candidates that the health filter accepts, scanning the platform view in
+// shard order.
+//
+// It is the fallback for when random draws keep landing on rejected nodes: the
+// cap keeps the cost constant no matter how large the view is, and stopping
+// early leaves a subset of the acceptable nodes — the same trade-off
+// strictCandidates already makes for rebinds.
+func healthyCandidateScan(
+	view platform.ReadOnlyView,
+	pool PoolAccessor,
+	exclude []node.Hash,
+	health HealthWeights,
+) []node.Hash {
+	candidates := make([]node.Hash, 0, 16)
+	view.Range(func(h node.Hash) bool {
+		if containsHash(exclude, h) {
+			return true
+		}
+		if !health.allows(pool, h) {
+			return true
+		}
+		candidates = append(candidates, h)
+		return len(candidates) < healthyScanCap
+	})
+	return candidates
 }
 
 // compareLatencies determines the latency values for h1 and h2.

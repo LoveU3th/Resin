@@ -86,3 +86,24 @@ func TestRecheck_FailoverBudgetStaysZeroWhenUnset(t *testing.T) {
 		t.Fatalf("AttemptBudget: got %v, want 0", got.AttemptBudget)
 	}
 }
+
+// The escalation knob must reach the data plane: without it a poor pool gives
+// up at MaxAttempts even though every failure was provably pre-upstream.
+func TestRecheck_FailoverEscalationIsWired(t *testing.T) {
+	app := newRecheckApp(60*time.Second, nil)
+	got := app.failoverConfig()
+
+	want := config.NewDefaultRuntimeConfig().FailoverConnectExtraAttempts
+	if got.ConnectFailureExtraAttempts != want {
+		t.Fatalf("ConnectFailureExtraAttempts: got %d, want %d",
+			got.ConnectFailureExtraAttempts, want)
+	}
+
+	// An operator who turned the knob off must stay off.
+	off := newRecheckApp(60*time.Second, func(c *config.RuntimeConfig) {
+		c.FailoverConnectExtraAttempts = 0
+	})
+	if got := off.failoverConfig(); got.ConnectFailureExtraAttempts != 0 {
+		t.Fatalf("ConnectFailureExtraAttempts: got %d, want 0", got.ConnectFailureExtraAttempts)
+	}
+}

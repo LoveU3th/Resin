@@ -657,9 +657,10 @@ func (a *resinApp) failoverConfig() proxy.FailoverConfig {
 	}
 
 	return proxy.FailoverConfig{
-		Enabled:       cfg.FailoverEnabled,
-		MaxAttempts:   cfg.FailoverMaxAttempts,
-		AttemptBudget: attemptBudget,
-		TotalBudget:   time.Duration(cfg.FailoverTotalBudget),
+		Enabled:                     cfg.FailoverEnabled,
+		MaxAttempts:                 cfg.FailoverMaxAttempts,
+		ConnectFailureExtraAttempts: cfg.FailoverConnectExtraAttempts,
+		AttemptBudget:               attemptBudget,
+		TotalBudget:                 time.Duration(cfg.FailoverTotalBudget),
 	}
 }

@@ -63,7 +63,17 @@ type NodeEntry struct {
 	LastLatencyProbeAttempt          atomic.Int64
 	LastAuthorityLatencyProbeAttempt atomic.Int64
 	LastEgressUpdateAttempt          atomic.Int64
-	LatencyTable                     *LatencyTable // per-domain latency stats; nil if not initialized
+	// egressFailStreak counts consecutive egress-probe failures since the last
+	// success, saturating at MaxInt32. It drives the retry backoff for a node
+	// that has never produced a successful egress sample: without it, retrying
+	// such a node on a short fixed interval would keep a permanently
+	// cloudflare-unreachable node hot forever.
+	//
+	// Not persisted, like CircuitCooldownNs: after a restart the streak starts
+	// at zero, so the first retry happens at the base interval. Losing the
+	// backoff progress only means a few extra probes after a restart.
+	egressFailStreak atomic.Int32
+	LatencyTable     *LatencyTable // per-domain latency stats; nil if not initialized
 
 	// Outbound instance for this node.
 	Outbound atomic.Pointer[adapter.Outbound]
@@ -206,6 +216,39 @@ func (e *NodeEntry) RecordHealthSample(success bool, weight float64, window, min
 			return
 		}
 	}
+}
+
+// --- Egress-probe retry backoff ---
+
+// RecordEgressProbeResult folds one egress-probe outcome into the retry
+// backoff streak and returns the new streak. A success resets it to zero; a
+// failure increments it, saturating at math.MaxInt32.
+//
+// The streak exists so the scheduler can back off a node that has never
+// produced an egress sample: such a node cannot be routed (no egress IP), so
+// it is retried on a short interval — but a node that keeps failing must
+// decay to the normal interval instead of being probed forever.
+func (e *NodeEntry) RecordEgressProbeResult(success bool) int32 {
+	if success {
+		e.egressFailStreak.Store(0)
+		return 0
+	}
+	for {
+		old := e.egressFailStreak.Load()
+		next := old + 1
+		if next < 0 { // overflow
+			next = math.MaxInt32
+		}
+		if e.egressFailStreak.CompareAndSwap(old, next) {
+			return next
+		}
+	}
+}
+
+// EgressFailStreak returns the number of consecutive egress-probe failures
+// since the last success.
+func (e *NodeEntry) EgressFailStreak() int32 {
+	return e.egressFailStreak.Load()
 }
 
 // SubscriptionIDs returns a copy of the subscription ID slice (thread-safe).
