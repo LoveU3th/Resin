@@ -1,4 +1,5 @@
 import { apiRequest } from "../../lib/api-client";
+import { alignTrendWindow, getTrendBucketWidth } from "./trend-aggregation";
 import type {
   DashboardGlobalData,
   DashboardPlatformData,
@@ -527,8 +528,12 @@ export async function getDashboardGlobalRealtimeData(
   window: TimeWindow,
   previous?: DashboardGlobalRealtimeData,
 ): Promise<DashboardGlobalRealtimeData> {
-  const throughputWindow = buildRealtimeIncrementalWindow(
+  const throughputDisplayWindow = alignTrendWindow(
     window,
+    getTrendBucketWidth(Date.parse(window.to) - Date.parse(window.from)),
+  );
+  const throughputWindow = buildRealtimeIncrementalWindow(
+    throughputDisplayWindow,
     previous?.realtime_throughput.items,
     previous?.realtime_throughput.step_seconds,
   );
@@ -550,7 +555,7 @@ export async function getDashboardGlobalRealtimeData(
   ]);
 
   return {
-    realtime_throughput: mergeRealtimeResponse(window, previous?.realtime_throughput, nextThroughput),
+    realtime_throughput: mergeRealtimeResponse(throughputDisplayWindow, previous?.realtime_throughput, nextThroughput),
     realtime_connections: mergeRealtimeResponse(window, previous?.realtime_connections, nextConnections),
     realtime_leases: {
       platform_id: toString(nextLeases.platform_id) || previous?.realtime_leases.platform_id || "",

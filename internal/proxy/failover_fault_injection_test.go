@@ -299,7 +299,7 @@ func (e *fiEnv) forwardRequest(
 	} else {
 		req = httptest.NewRequest(method, target, strings.NewReader(body))
 	}
-	req.Header.Set("Proxy-Authorization", basicAuth("tok", "plat:"+account))
+	req.Header.Set("Proxy-Authorization", basicAuth("plat."+account, "tok"))
 	w := httptest.NewRecorder()
 	fp.ServeHTTP(w, req)
 	return w
@@ -658,7 +658,7 @@ func TestFaultInjection_ClientCancelIsNotRetriedOrRecorded(t *testing.T) {
 	env.pinLease(t, "acct-1", 0)
 
 	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/s7", nil)
-	req.Header.Set("Proxy-Authorization", basicAuth("tok", "plat:acct-1"))
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.acct-1", "tok"))
 	ctx, cancel := context.WithCancel(req.Context())
 	req = req.WithContext(ctx)
 	w := httptest.NewRecorder()
@@ -786,7 +786,7 @@ func TestFaultInjection_BypassExcludedFromFirstHopStats(t *testing.T) {
 			Failover:         FailoverConfig{Enabled: true, MaxAttempts: 2},
 		})
 		req := httptest.NewRequest(http.MethodGet, upstream.URL+"/bypass", nil)
-		req.Header.Set("Proxy-Authorization", basicAuth("tok", "plat:acct-1"))
+		req.Header.Set("Proxy-Authorization", basicAuth("plat.acct-1", "tok"))
 		w := httptest.NewRecorder()
 		fp.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
@@ -1049,7 +1049,7 @@ func TestFaultInjection_CONNECTDialFailureIsCountedOnce(t *testing.T) {
 	}
 	defer conn.Close()
 	_, _ = fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: %s\r\n\r\n",
-		basicAuth("tok", "plat:acct-1"))
+		basicAuth("plat.acct-1", "tok"))
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
@@ -1175,7 +1175,7 @@ func TestFaultInjection_CONNECTFailoverIsVisibleInFirstHopStats(t *testing.T) {
 	}
 	defer conn.Close()
 	_, _ = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
-		u.Host, u.Host, basicAuth("tok", "plat:acct-1"))
+		u.Host, u.Host, basicAuth("plat.acct-1", "tok"))
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)

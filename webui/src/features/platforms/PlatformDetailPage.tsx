@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
-import { AlertTriangle, ArrowLeft, Info, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Info, RefreshCw, Search, Sparkles, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
@@ -52,6 +52,7 @@ type PlatformDetailTab = "monitor" | "access" | "config" | "ops";
 
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 const LEASE_MANAGEMENT_ANCHOR = "platform-lease-management";
+const LEASE_SEARCH_DEBOUNCE_MS = 300;
 const LEASE_PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DETAIL_TABS: Array<{ key: PlatformDetailTab; label: string; hint: string }> = [
   { key: "monitor", label: "监控", hint: "平台运行态趋势和快照" },
@@ -68,6 +69,8 @@ export function PlatformDetailPage() {
   const [activeTab, setActiveTab] = useState<PlatformDetailTab>("monitor");
   const [leasePage, setLeasePage] = useState(0);
   const [leasePageSize, setLeasePageSize] = useState<number>(LEASE_PAGE_SIZE_OPTIONS[0]);
+  const [leaseSearch, setLeaseSearch] = useState("");
+  const [debouncedLeaseSearch, setDebouncedLeaseSearch] = useState("");
   const { toasts, showToast, dismissToast } = useToast();
   const queryClient = useQueryClient();
   const formatPlatformMutationError = (error: unknown) => {
@@ -89,7 +92,7 @@ export function PlatformDetailPage() {
   const platform = platformQuery.data ?? null;
 
   const leaseQuery = useQuery({
-    queryKey: ["platform-leases", platform?.id, leasePage, leasePageSize],
+    queryKey: ["platform-leases", platform?.id, leasePage, leasePageSize, debouncedLeaseSearch],
     queryFn: () => {
       if (!platform) {
         throw new Error("平台不存在或已被删除");
@@ -97,6 +100,8 @@ export function PlatformDetailPage() {
       return listPlatformLeases(platform.id, {
         limit: leasePageSize,
         offset: leasePage * leasePageSize,
+        account: debouncedLeaseSearch,
+        fuzzy: debouncedLeaseSearch ? true : undefined,
         sort_by: "expiry",
         sort_order: "asc",
       });
@@ -113,6 +118,8 @@ export function PlatformDetailPage() {
     offset: leasePage * leasePageSize,
   };
   const leases = leasesPage.items;
+  const isLeasePageTransitioning = leaseQuery.isFetching && leaseQuery.isPlaceholderData;
+  const visibleLeases = isLeasePageTransitioning ? [] : leases;
   const leaseTotalPages = Math.max(1, Math.ceil(leasesPage.total / leasePageSize));
 
   const editForm = useForm<PlatformFormValues>({
@@ -130,7 +137,17 @@ export function PlatformDetailPage() {
 
   useEffect(() => {
     setLeasePage(0);
+    setLeaseSearch("");
+    setDebouncedLeaseSearch("");
   }, [platformId]);
+
+  useEffect(() => {
+    const timeoutID = window.setTimeout(() => {
+      setDebouncedLeaseSearch(leaseSearch.trim());
+      setLeasePage(0);
+    }, LEASE_SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutID);
+  }, [leaseSearch]);
 
   useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(leasesPage.total / leasePageSize) - 1);
@@ -620,26 +637,19 @@ export function PlatformDetailPage() {
                   </div>
 
                   <div className="field-group">
-                    <label className="field-label field-label-with-info" htmlFor="detail-edit-regex">
-                      <span>{t("节点名正则过滤规则")}</span>
-                      <span
-                        className="subscription-info-icon"
-                        title={t("满足所有正则表达式的节点才会被选择")}
-                        aria-label={t("满足所有正则表达式的节点才会被选择")}
-                        tabIndex={0}
-                      >
-                        <Info size={13} />
-                      </span>
+                    <label className="field-label" htmlFor="detail-edit-regex">
+                      {t("节点名正则过滤规则")}
                     </label>
                     <Textarea
                       id="detail-edit-regex"
                       rows={6}
-                      placeholder={t("每行一条，例如 .*专线.* 或 <订阅名>/.*")}
+                      placeholder={t("每行一条正则表达式，例如：\n\n香港\n日本\n*专线\n!过期\n!失效\n\n表示：选择【香港】或【日本】的【专线】节点，并排除包含【过期】或【失效】的节点。")}
                       {...editForm.register("regex_filters_text")}
                     />
-                    <p className="muted" style={{ marginTop: 4, fontSize: 12 }}>
-                      {t("技巧：<订阅名>/.* 可筛选来自该订阅的节点。")}
-                    </p>
+                    <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                      <div>{t("普通正则表达式表示满足其一，* 开头表示必须包含，! 开头表示排除。")}</div>
+                      <div>{t("技巧：^<订阅名>/ 可筛选来自该订阅的节点。")}</div>
+                    </div>
                   </div>
 
                   <div className="field-group">
@@ -714,22 +724,35 @@ export function PlatformDetailPage() {
 
                 <section id={LEASE_MANAGEMENT_ANCHOR} className="platform-lease-section">
                   <div className="platform-drawer-section-head platform-lease-head">
-                    <div>
+                    <div className="platform-lease-heading">
                       <h4>{t("租约管理")}</h4>
                       <p>{t("查看当前平台的租约绑定，并按账号释放单个租约。")}</p>
                     </div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => void leaseQuery.refetch()}
-                      disabled={leaseQuery.isFetching}
-                    >
-                      <RefreshCw size={16} className={leaseQuery.isFetching ? "spin" : undefined} />
-                      {t("刷新")}
-                    </Button>
+                    <div className="platform-lease-toolbar">
+                      <label className="search-box platform-lease-search" htmlFor="platform-lease-search">
+                        <Search size={16} />
+                        <Input
+                          id="platform-lease-search"
+                          type="search"
+                          placeholder={t("搜索账号")}
+                          aria-label={t("搜索账号")}
+                          value={leaseSearch}
+                          onChange={(event) => setLeaseSearch(event.target.value)}
+                        />
+                      </label>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => void leaseQuery.refetch()}
+                        disabled={leaseQuery.isFetching}
+                      >
+                        <RefreshCw size={16} className={leaseQuery.isFetching ? "spin" : undefined} />
+                        {t("刷新")}
+                      </Button>
+                    </div>
                   </div>
 
-                  {leaseQuery.isLoading ? <p className="muted">{t("正在加载租约数据...")}</p> : null}
+                  {leaseQuery.isLoading || isLeasePageTransitioning ? <p className="muted">{t("正在加载租约数据...")}</p> : null}
 
                   {leaseQuery.isError ? (
                     <div className="callout callout-error">
@@ -738,16 +761,16 @@ export function PlatformDetailPage() {
                     </div>
                   ) : null}
 
-                  {!leaseQuery.isLoading && !leases.length ? (
+                  {!leaseQuery.isLoading && !leaseQuery.isError && !isLeasePageTransitioning && !visibleLeases.length ? (
                     <div className="empty-box">
                       <Sparkles size={16} />
-                      <p>{t("当前平台暂无租约")}</p>
+                      <p>{debouncedLeaseSearch ? t("没有匹配的租约") : t("当前平台暂无租约")}</p>
                     </div>
                   ) : null}
 
-                  {leases.length ? (
+                  {visibleLeases.length ? (
                     <DataTable
-                      data={leases}
+                      data={visibleLeases}
                       columns={leaseColumns}
                       getRowId={(lease) => lease.account}
                       className="data-table-leases"
@@ -761,6 +784,7 @@ export function PlatformDetailPage() {
                     totalItems={leasesPage.total}
                     pageSize={leasePageSize}
                     pageSizeOptions={LEASE_PAGE_SIZE_OPTIONS}
+                    disabled={isLeasePageTransitioning}
                     onPageChange={setLeasePage}
                     onPageSizeChange={changeLeasePageSize}
                   />

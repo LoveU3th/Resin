@@ -27,7 +27,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/topology"
 	M "github.com/sagernet/sing/common/metadata"
@@ -363,7 +362,7 @@ func TestFinal_ForwardCONNECTReportsFailover(t *testing.T) {
 	}
 	defer conn.Close()
 	_, _ = fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: %s\r\n\r\n",
-		basicAuth("tok", "plat:acct-1"))
+		basicAuth("plat.acct-1", "tok"))
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		t.Fatalf("read CONNECT response: %v", err)
@@ -392,7 +391,6 @@ func TestFinal_ReverseReportsFailover(t *testing.T) {
 
 	rp := NewReverseProxy(ReverseProxyConfig{
 		ProxyToken:     "tok",
-		AuthVersion:    string(config.AuthVersionV1),
 		Router:         env.router,
 		Pool:           env.pool,
 		PlatformLookup: env.pool,
@@ -436,12 +434,11 @@ func TestFinal_Socks5ReportsFailover(t *testing.T) {
 	emitter := newMockEventEmitter()
 
 	inbound := NewSocks5Inbound(Socks5InboundConfig{
-		ProxyToken:  "tok",
-		AuthVersion: string(config.AuthVersionV1),
-		Router:      env.router,
-		Pool:        env.pool,
-		Health:      env.pool,
-		Events:      emitter,
+		ProxyToken: "tok",
+		Router:     env.router,
+		Pool:       env.pool,
+		Health:     env.pool,
+		Events:     emitter,
 		OutboundTransport: OutboundTransportConfig{
 			DialTimeout:           300 * time.Millisecond,
 			ResponseHeaderTimeout: 2 * time.Second,
@@ -567,7 +564,7 @@ func TestFinal_PlatformOptOutHoldsOnTunnelPath(t *testing.T) {
 			t.Fatalf("dial proxy: %v", err)
 		}
 		_, _ = fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: %s\r\n\r\n",
-			basicAuth("tok", "plat:acct-1"))
+			basicAuth("plat.acct-1", "tok"))
 		if _, err := http.ReadResponse(bufio.NewReader(conn), nil); err != nil {
 			t.Logf("C2 attempt %d: no CONNECT response (%v)", i, err)
 		}

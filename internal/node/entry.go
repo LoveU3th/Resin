@@ -18,6 +18,19 @@ import (
 // Returns ok=false if the subscription does not exist.
 type SubLookupFunc func(subID string, hash Hash) (name string, enabled bool, tags []string, ok bool)
 
+// TagFilter is a compiled set of line-oriented tag regex rules.
+// Any rules are ORed, Must rules are ANDed, and any MustNot match rejects the node.
+type TagFilter struct {
+	Any     []*regexp.Regexp
+	Must    []*regexp.Regexp
+	MustNot []*regexp.Regexp
+}
+
+// Empty reports whether the filter contains no rules.
+func (f TagFilter) Empty() bool {
+	return len(f.Any) == 0 && len(f.Must) == 0 && len(f.MustNot) == 0
+}
+
 // NodeEntry represents a node in the global pool.
 // Static fields are set at creation; dynamic fields use atomics or mutex.
 type NodeEntry struct {
@@ -302,8 +315,15 @@ func (e *NodeEntry) SubscriptionCount() int {
 //   - if subLookup is nil, it matches everything (compatibility fallback);
 //   - otherwise, it matches only when at least one enabled subscription exists.
 func (e *NodeEntry) MatchRegexs(regexes []*regexp.Regexp, subLookup SubLookupFunc) bool {
+	return e.MatchTagFilter(TagFilter{Must: regexes}, subLookup)
+}
+
+// MatchTagFilter tests the node's enabled-subscription tags against a compiled filter.
+// Positive rules must be satisfied by one "<subscriptionName>/<tag>" candidate.
+// MustNot rules inspect every candidate and reject the whole node on any match.
+func (e *NodeEntry) MatchTagFilter(filter TagFilter, subLookup SubLookupFunc) bool {
 	if subLookup == nil {
-		return len(regexes) == 0
+		return filter.Empty()
 	}
 
 	e.mu.RLock()
@@ -311,34 +331,37 @@ func (e *NodeEntry) MatchRegexs(regexes []*regexp.Regexp, subLookup SubLookupFun
 	copy(subs, e.subscriptionIDs)
 	e.mu.RUnlock()
 
-	if len(regexes) == 0 {
-		for _, subID := range subs {
-			_, enabled, _, ok := subLookup(subID, e.Hash)
-			if ok && enabled {
-				return true
-			}
-		}
-		// Empty regex with lookup still requires at least one enabled subscription.
-		return false
-	}
-
 	if len(subs) == 0 {
 		return false
 	}
+
+	hasEnabledSubscription := false
+	hasPositiveRules := len(filter.Any) > 0 || len(filter.Must) > 0
+	matchedPositive := false
 
 	for _, subID := range subs {
 		name, enabled, tags, ok := subLookup(subID, e.Hash)
 		if !ok || !enabled {
 			continue
 		}
+		hasEnabledSubscription = true
 		for _, tag := range tags {
 			candidate := name + "/" + tag
-			if matchesAll(candidate, regexes) {
-				return true
+			if matchesAny(candidate, filter.MustNot) {
+				return false
+			}
+			if !matchedPositive &&
+				matchesAll(candidate, filter.Must) &&
+				(len(filter.Any) == 0 || matchesAny(candidate, filter.Any)) {
+				matchedPositive = true
 			}
 		}
 	}
-	return false
+
+	if !hasPositiveRules {
+		return hasEnabledSubscription
+	}
+	return matchedPositive
 }
 
 // HasEnabledSubscription reports whether the node currently has at least one
@@ -380,6 +403,16 @@ func matchesAll(s string, regexes []*regexp.Regexp) bool {
 		}
 	}
 	return true
+}
+
+// matchesAny returns true if s matches at least one regex in the list.
+func matchesAny(s string, regexes []*regexp.Regexp) bool {
+	for _, re := range regexes {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Condition helpers for platform filtering ---

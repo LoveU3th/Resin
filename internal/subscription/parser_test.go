@@ -3,6 +3,7 @@ package subscription
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -851,9 +852,8 @@ func TestParseGeneralSubscription_ClashJSON_HysteriaAdvancedFields(t *testing.T)
 	if !containsAnyString(certificates, "-----BEGIN CERTIFICATE-----ABC") {
 		t.Fatalf("tls.certificate: got %v", certificates)
 	}
-	utls := mustMapField(t, tls, "utls")
-	if got := utls["fingerprint"]; got != "chrome" {
-		t.Fatalf("tls.utls.fingerprint: got %v", got)
+	if got, exists := tls["utls"]; exists {
+		t.Fatalf("QUIC must not use uTLS, got %v", got)
 	}
 }
 
@@ -1035,9 +1035,8 @@ func TestParseGeneralSubscription_ClashJSON_Hysteria2AdvancedFields(t *testing.T
 	if !containsAnyString(certificates, "-----BEGIN CERTIFICATE-----XYZ") {
 		t.Fatalf("tls.certificate: got %v", certificates)
 	}
-	utls := mustMapField(t, tls, "utls")
-	if got := utls["fingerprint"]; got != "firefox" {
-		t.Fatalf("tls.utls.fingerprint: got %v", got)
+	if got, exists := tls["utls"]; exists {
+		t.Fatalf("QUIC must not use uTLS, got %v", got)
 	}
 }
 
@@ -1622,6 +1621,87 @@ func TestParseGeneralSubscription_VMessURIExtendedTransports(t *testing.T) {
 	}
 }
 
+func TestParseGeneralSubscription_VMessURIHTTPHeader(t *testing.T) {
+	cases := []struct {
+		name          string
+		networkKey    string
+		network       string
+		headerType    string
+		host          string
+		wantTransport string
+	}{
+		{name: "tcp", networkKey: "net", network: "tcp", headerType: "http", wantTransport: "http"},
+		{name: "raw", networkKey: "net", network: "raw", headerType: "http", host: "front.example.com", wantTransport: "http"},
+		{name: "network alias", networkKey: "network", network: "tcp", headerType: "http", host: "a.example.com,b.example.com", wantTransport: "http"},
+		{name: "missing network", headerType: "http", wantTransport: "http"},
+		{name: "empty network", networkKey: "net", headerType: "http", wantTransport: "http"},
+		{name: "case and whitespace", networkKey: "net", network: " RAW ", headerType: " HTTP ", wantTransport: "http"},
+		{name: "plain tcp", networkKey: "net", network: "tcp", headerType: "none"},
+		{name: "plain raw", networkKey: "net", network: "raw", headerType: "none"},
+		{name: "websocket wins", networkKey: "net", network: "ws", headerType: "http", wantTransport: "ws"},
+		{name: "grpc wins", networkKey: "net", network: "grpc", headerType: "http", wantTransport: "grpc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]any{
+				"v": "2", "ps": "HTTP-header-test", "add": "example.com", "port": 60443,
+				"id": "00000000-0000-0000-0000-000000000000", "aid": 0, "scy": "auto",
+				"type": tc.headerType, "host": tc.host, "path": "/", "tls": "none",
+			}
+			if tc.networkKey != "" {
+				payload[tc.networkKey] = tc.network
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			nodes, err := ParseGeneralSubscription([]byte("vmess://" + base64.StdEncoding.EncodeToString(raw)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(nodes) != 1 {
+				t.Fatalf("expected 1 parsed node, got %d", len(nodes))
+			}
+			obj := parseNodeRaw(t, nodes[0].RawOptions)
+			if got, exists := obj["tls"]; exists {
+				t.Fatalf("HTTP header obfuscation must not enable TLS, got %v", got)
+			}
+			if tc.wantTransport == "" {
+				if got, exists := obj["transport"]; exists {
+					t.Fatalf("plain TCP must not have transport, got %v", got)
+				}
+				return
+			}
+			transport := mustMapField(t, obj, "transport")
+			if got := transport["type"]; got != tc.wantTransport {
+				t.Fatalf("transport.type: got %v, want %s", got, tc.wantTransport)
+			}
+			if tc.wantTransport != "http" {
+				return
+			}
+			if got := transport["path"]; got != "/" {
+				t.Fatalf("transport.path: got %v, want /", got)
+			}
+			if tc.host == "" {
+				if got, exists := transport["host"]; exists {
+					t.Fatalf("empty host must be omitted, got %v", got)
+				}
+			} else {
+				hosts := mustSliceField(t, transport, "host")
+				wantHosts := strings.Split(tc.host, ",")
+				if len(hosts) != len(wantHosts) {
+					t.Fatalf("transport.host: got %v, want %v", hosts, wantHosts)
+				}
+				for i, host := range wantHosts {
+					if hosts[i] != host {
+						t.Fatalf("transport.host: got %v, want %v", hosts, wantHosts)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestParseGeneralSubscription_TrojanURITLSAdvancedFields(t *testing.T) {
 	data := []byte(
 		"trojan://password@example.com:443?type=tcp&sni=example.com&allowInsecure=1&alpn=h2%2Chttp%2F1.1&fp=edge",
@@ -1739,9 +1819,87 @@ func TestParseGeneralSubscription_HY2URIAliasAndQueryPassword(t *testing.T) {
 	if got := tls["certificate_path"]; got != "/etc/ssl/certs/hy2.pem" {
 		t.Fatalf("tls.certificate_path: got %v", got)
 	}
-	utls := mustMapField(t, tls, "utls")
-	if got := utls["fingerprint"]; got != "chrome" {
-		t.Fatalf("tls.utls.fingerprint: got %v", got)
+	if got, exists := tls["utls"]; exists {
+		t.Fatalf("QUIC must not use uTLS, got %v", got)
+	}
+}
+
+func TestParseGeneralSubscription_QUICIgnoresTLSFingerprint(t *testing.T) {
+	type fingerprintCase struct {
+		name        string
+		input       string
+		fingerprint string
+		vmess       bool
+	}
+	cases := []fingerprintCase{
+		{
+			name:        "hysteria2 URI",
+			input:       "hysteria2://password@example.com:443?alpn=h3&sni=sni.example.com&insecure=1&obfs=salamander&obfs-password=secret%s#QUIC-test",
+			fingerprint: "&%s=chrome",
+		},
+		{
+			name:        "hy2 URI",
+			input:       "hy2://example.com:443?password=password&alpn=h3&sni=sni.example.com&insecure=1%s#QUIC-test",
+			fingerprint: "&%s=chrome",
+		},
+		{
+			name:        "VMess QUIC URI",
+			input:       `{"v":"2","ps":"QUIC-test","add":"example.com","port":443,"id":"00000000-0000-0000-0000-000000000000","net":"quic","tls":"tls","sni":"sni.example.com","alpn":"h3","allowInsecure":true%s}`,
+			fingerprint: `,"%s":"chrome"`,
+			vmess:       true,
+		},
+		{
+			name:        "VLESS QUIC URI",
+			input:       "vless://00000000-0000-0000-0000-000000000000@example.com:443?type=quic&security=tls&sni=sni.example.com&alpn=h3&insecure=1%s#QUIC-test",
+			fingerprint: "&%s=chrome",
+		},
+		{
+			name:        "Trojan QUIC URI",
+			input:       "trojan://password@example.com:443?type=quic&sni=sni.example.com&alpn=h3&insecure=1%s#QUIC-test",
+			fingerprint: "&%s=chrome",
+		},
+	}
+	for _, protocol := range []string{"hysteria", "hysteria2", "hy2", "tuic", "vmess", "vless", "trojan"} {
+		cases = append(cases, fingerprintCase{
+			name:        "Clash JSON " + protocol,
+			input:       fmt.Sprintf(`{"proxies":[{"name":"QUIC-test","type":%q,"server":"example.com","port":443,"password":"password","auth-str":"password","uuid":"00000000-0000-0000-0000-000000000000","up":30,"down":100,"network":"quic","tls":true,"sni":"sni.example.com","alpn":["h3"],"skip-cert-verify":true%s}]}`, protocol, "%s"),
+			fingerprint: `,"%s":"chrome"`,
+		})
+	}
+	for _, protocol := range []string{"hysteria", "hysteria2", "hy2", "tuic"} {
+		cases = append(cases, fingerprintCase{
+			name:        "Clash YAML " + protocol,
+			input:       fmt.Sprintf("proxies:\n  - name: QUIC-test\n    type: %s\n    server: example.com\n    port: 443\n    password: password\n    auth-str: password\n    uuid: 00000000-0000-0000-0000-000000000000\n    up: 30\n    down: 100\n    sni: sni.example.com\n    alpn: [h3]\n    skip-cert-verify: true\n%s", protocol, "%s"),
+			fingerprint: "    %s: chrome\n",
+		})
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parse := func(t *testing.T, field string) ParsedNode {
+				t.Helper()
+				input := fmt.Sprintf(tc.input, field)
+				if tc.vmess {
+					input = "vmess://" + base64.StdEncoding.EncodeToString([]byte(input))
+				}
+				nodes, err := ParseGeneralSubscription([]byte(input))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(nodes) != 1 {
+					t.Fatalf("expected 1 parsed node, got %d", len(nodes))
+				}
+				return nodes[0]
+			}
+			baseline := parse(t, "")
+			for _, key := range []string{"fp", "fingerprint", "client-fingerprint", "client_fingerprint"} {
+				t.Run(key, func(t *testing.T) {
+					got := parse(t, fmt.Sprintf(tc.fingerprint, key))
+					if string(got.RawOptions) != string(baseline.RawOptions) {
+						t.Fatalf("QUIC fingerprint must be ignored without changing other options:\ngot  %s\nwant %s", got.RawOptions, baseline.RawOptions)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -2394,6 +2552,37 @@ socks5h://user-s5h:pass-s5h@proxy.example.net:1082#SOCKS5H%20Node
 	}
 	if got := fourth["password"]; got != "pass-s5h" {
 		t.Fatalf("expected fourth password pass-s5h, got %v", got)
+	}
+}
+
+func TestParseGeneralSubscription_ProxyURIDefaultTagsDistinguishHTTPS(t *testing.T) {
+	data := []byte(`
+http://1.2.3.4:8080
+https://example.com:8443
+`)
+
+	nodes, err := ParseGeneralSubscription(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 parsed nodes, got %d", len(nodes))
+	}
+
+	httpNode := parseNodeRaw(t, nodes[0].RawOptions)
+	httpsNode := parseNodeRaw(t, nodes[1].RawOptions)
+	if got := httpNode["tag"]; got != "http-1.2.3.4:8080" {
+		t.Fatalf("expected HTTP default tag, got %v", got)
+	}
+	if got := httpsNode["tag"]; got != "https-example.com:8443" {
+		t.Fatalf("expected HTTPS default tag, got %v", got)
+	}
+	if got := httpsNode["type"]; got != "http" {
+		t.Fatalf("expected HTTPS proxy outbound type http, got %v", got)
+	}
+	tls, ok := httpsNode["tls"].(map[string]any)
+	if !ok || tls["enabled"] != true {
+		t.Fatalf("expected HTTPS proxy TLS enabled, got %v", httpsNode["tls"])
 	}
 }
 

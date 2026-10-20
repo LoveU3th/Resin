@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -726,7 +725,7 @@ func (s *ControlPlaneService) PreviewFilter(req PreviewFilterRequest) ([]NodeSum
 		return nil, invalidArg("exactly one of platform_id or platform_spec is required")
 	}
 
-	var regexFilters []*regexp.Regexp
+	var regexFilters node.TagFilter
 	var regionFilters []string
 
 	if hasPlatformID {
@@ -754,7 +753,7 @@ func (s *ControlPlaneService) PreviewFilter(req PreviewFilterRequest) ([]NodeSum
 	}
 	var result []NodeSummary
 	s.Pool.Range(func(h node.Hash, entry *node.NodeEntry) bool {
-		if !entry.MatchRegexs(regexFilters, subLookup) {
+		if !entry.MatchTagFilter(regexFilters, subLookup) {
 			return true
 		}
 		if len(regionFilters) > 0 {

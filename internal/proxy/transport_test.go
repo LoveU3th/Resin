@@ -315,7 +315,7 @@ func TestDialOutbound_FailedDialCancelsImmediately(t *testing.T) {
 // in one place only). Assert they agree.
 func TestTransportDefaultsMatchEnvConfigDefaults(t *testing.T) {
 	for k, v := range map[string]string{
-		"RESIN_AUTH_VERSION": "LEGACY_V0",
+		"RESIN_AUTH_VERSION": "V1",
 		"RESIN_ADMIN_TOKEN":  "admin-secret",
 		"RESIN_PROXY_TOKEN":  "proxy-secret",
 	} {

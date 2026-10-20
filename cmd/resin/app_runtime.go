@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,22 +29,18 @@ import (
 )
 
 type resinApp struct {
-	envCfg         *config.EnvConfig
-	runtimeCfg     *atomic.Pointer[config.RuntimeConfig]
-	accountMatcher *proxy.AccountMatcherRuntime
-	geoSvc         *geoip.Service
-	topoRuntime    *topologyRuntime
-	flushWorker    *state.CacheFlushWorker
-	metricsDB      *metrics.MetricsRepo
-	metricsManager *metrics.Manager
-	requestlogRepo *requestlog.Repo
-	requestlogSvc  *requestlog.Service
-	inboundSrv     interface {
-		Serve(net.Listener) error
-		Shutdown(context.Context) error
-	}
-	inboundLn     net.Listener
-	transportPool *proxy.OutboundTransportPool
+	envCfg          *config.EnvConfig
+	runtimeCfg      *atomic.Pointer[config.RuntimeConfig]
+	accountMatcher  *proxy.AccountMatcherRuntime
+	geoSvc          *geoip.Service
+	topoRuntime     *topologyRuntime
+	flushWorker     *state.CacheFlushWorker
+	metricsDB       *metrics.MetricsRepo
+	metricsManager  *metrics.Manager
+	requestlogRepo  *requestlog.Repo
+	requestlogSvc   *requestlog.Service
+	endpointManager *endpointRuntimeManager
+	transportPool   *proxy.OutboundTransportPool
 }
 
 func run() error {
@@ -57,9 +51,6 @@ func run() error {
 	envCfg, err := config.LoadEnvConfig()
 	if err != nil {
 		return err
-	}
-	if warning := authVersionStartupWarning(envCfg.AuthVersion); warning != "" {
-		startupWarnf("%s", warning)
 	}
 
 	engine, dbCloser, err := state.PersistenceBootstrap(envCfg.StateDir, envCfg.CacheDir)
@@ -451,7 +442,6 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 
 	forwardProxy := proxy.NewForwardProxy(proxy.ForwardProxyConfig{
 		ProxyToken:          a.envCfg.ProxyToken,
-		AuthVersion:         string(a.envCfg.AuthVersion),
 		Router:              a.topoRuntime.router,
 		Pool:                a.topoRuntime.pool,
 		Health:              a.topoRuntime.pool,
@@ -466,7 +456,6 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
 		ProxyToken:        a.envCfg.ProxyToken,
-		AuthVersion:       string(a.envCfg.AuthVersion),
 		Router:            a.topoRuntime.router,
 		Pool:              a.topoRuntime.pool,
 		PlatformLookup:    a.topoRuntime.pool,
@@ -481,7 +470,6 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 	})
 	socks5Inbound := proxy.NewSocks5Inbound(proxy.Socks5InboundConfig{
 		ProxyToken:          a.envCfg.ProxyToken,
-		AuthVersion:         string(a.envCfg.AuthVersion),
 		Router:              a.topoRuntime.router,
 		Pool:                a.topoRuntime.pool,
 		Health:              a.topoRuntime.pool,
@@ -493,20 +481,44 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		Failover:            a.failoverConfig(),
 	})
 
-	inboundHandler := newInboundMux(
+	endpointManager := newEndpointRuntimeManager(
+		a.envCfg.ListenAddress,
 		a.envCfg.ProxyToken,
 		forwardProxy,
 		reverseProxy,
 		apiSrv.Handler(),
 		tokenActionHandler,
+		socks5Inbound,
+		a.metricsManager,
 	)
-	inboundLn, err := net.Listen("tcp", formatListenAddress(a.envCfg.ListenAddress, a.envCfg.ResinPort))
-	if err != nil {
-		return fmt.Errorf("resin server listen: %w", err)
+	cpService.EndpointRuntime = endpointManager
+	defaultEndpoint := service.NewDefaultEndpoint(a.envCfg.ResinPort)
+	if err := endpointManager.ApplyEndpoint(defaultEndpoint); err != nil {
+		return fmt.Errorf("default endpoint listen: %w", err)
 	}
-	a.inboundLn = proxy.NewCountingListener(inboundLn, a.metricsManager)
-	a.inboundSrv = newInboundDemuxServer(&http.Server{Handler: inboundHandler}, socks5Inbound)
+	if err := restorePersistedEndpoints(engine, endpointManager); err != nil {
+		endpointManager.RemoveEndpoint(service.DefaultEndpointID)
+		return fmt.Errorf("load endpoints: %w", err)
+	}
+	a.endpointManager = endpointManager
 
+	return nil
+}
+
+func restorePersistedEndpoints(engine *state.StateEngine, endpointManager *endpointRuntimeManager) error {
+	customEndpoints, err := engine.ListEndpoints()
+	if err != nil {
+		return err
+	}
+	for _, endpoint := range customEndpoints {
+		if !endpoint.Enabled {
+			continue
+		}
+		if err := endpointManager.ApplyEndpoint(endpoint); err != nil {
+			endpointManager.RecordEndpointError(endpoint, err)
+			log.Printf("Endpoint %s on port %d unavailable: %v", endpoint.ID, endpoint.Port, err)
+		}
+	}
 	return nil
 }
 
@@ -537,28 +549,12 @@ func (a *resinApp) buildProxyEvents() proxy.ConfigAwareEventEmitter {
 }
 
 func (a *resinApp) startServers() <-chan error {
-	serverErrCh := make(chan error, 1)
-	reportServerErr := func(name string, err error) {
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return
-		}
-		wrapped := fmt.Errorf("%s: %w", name, err)
-		select {
-		case serverErrCh <- wrapped:
-		default:
-		}
-	}
-
-	go func() {
-		log.Printf(
-			"Resin server starting on %s (%s)",
-			formatListenAddress(a.envCfg.ListenAddress, a.envCfg.ResinPort),
-			inboundProtocolsStartupLabel(a.envCfg.AuthVersion),
-		)
-		reportServerErr("resin server", a.inboundSrv.Serve(a.inboundLn))
-	}()
-
-	return serverErrCh
+	log.Printf(
+		"Resin default endpoint starting on %s (%s)",
+		formatListenAddress(a.envCfg.ListenAddress, a.envCfg.ResinPort),
+		"HTTP + SOCKS5",
+	)
+	return a.endpointManager.Start()
 }
 
 func waitForShutdown(serverErrCh <-chan error) error {
@@ -585,7 +581,7 @@ func formatListenURL(listenAddress string, port int) string {
 }
 
 func (a *resinApp) shutdown(ctx context.Context) {
-	if err := a.inboundSrv.Shutdown(ctx); err != nil {
+	if err := a.endpointManager.Shutdown(ctx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 	}
 	log.Println("Resin server stopped")

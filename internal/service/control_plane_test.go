@@ -892,7 +892,7 @@ func TestDeletePlatform_DoesNotDecodeCorruptPersistedFiltersJSON(t *testing.T) {
 	pool.RegisterPlatform(platform.NewConfiguredPlatform(
 		platformRow.ID,
 		platformRow.Name,
-		nil,
+		node.TagFilter{},
 		nil,
 		platformRow.StickyTTLNs,
 		platformRow.ReverseProxyMissAction,
@@ -955,7 +955,7 @@ func TestResetPlatformToDefault_SupportsBuiltInDefaultPlatform(t *testing.T) {
 	pool.RegisterPlatform(platform.NewConfiguredPlatform(
 		defaultRow.ID,
 		defaultRow.Name,
-		nil,
+		node.TagFilter{},
 		nil,
 		defaultRow.StickyTTLNs,
 		defaultRow.ReverseProxyMissAction,
@@ -1036,7 +1036,7 @@ func TestResetPlatformToDefault_SupportsBuiltInDefaultPlatform(t *testing.T) {
 	if plat.StickyTTLNs != int64(45*time.Minute) {
 		t.Fatalf("pool sticky_ttl_ns = %d, want %d", plat.StickyTTLNs, int64(45*time.Minute))
 	}
-	if len(plat.RegexFilters) != 1 || plat.RegexFilters[0].String() != "^prod-" {
+	if len(plat.RegexFilters.Any) != 1 || plat.RegexFilters.Any[0].String() != "^prod-" {
 		t.Fatalf("pool regex_filters = %v, want [%q]", plat.RegexFilters, "^prod-")
 	}
 	if !reflect.DeepEqual(plat.RegionFilters, []string{"jp"}) {
@@ -1097,7 +1097,7 @@ func TestResetPlatformToDefault_DoesNotDecodeCorruptPersistedFiltersJSON(t *test
 	pool.RegisterPlatform(platform.NewConfiguredPlatform(
 		platformRow.ID,
 		platformRow.Name,
-		nil,
+		node.TagFilter{},
 		nil,
 		platformRow.StickyTTLNs,
 		platformRow.ReverseProxyMissAction,

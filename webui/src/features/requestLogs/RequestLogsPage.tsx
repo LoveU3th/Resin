@@ -37,6 +37,8 @@ type FilterDraft = {
   limit: number;
 };
 
+type DebouncedTextFilters = Pick<FilterDraft, "platform_name" | "account" | "target_host" | "egress_ip" | "http_status">;
+
 const defaultFilters: FilterDraft = {
   from_local: "",
   to_local: "",
@@ -49,6 +51,7 @@ const defaultFilters: FilterDraft = {
   http_status: "",
   limit: 100,
 };
+const FILTER_DEBOUNCE_MS = 100;
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500, 1000, 2000] as const;
 const REQUEST_LOGS_FORWARD_BADGE_CLASS = "request-logs-proxy-badge-forward";
 const REQUEST_LOGS_REVERSE_BADGE_CLASS = "request-logs-proxy-badge-reverse";
@@ -288,6 +291,16 @@ function buildActiveFilters(draft: FilterDraft): Omit<RequestLogListFilters, "cu
   };
 }
 
+function pickDebouncedTextFilters(filters: FilterDraft): DebouncedTextFilters {
+  return {
+    platform_name: filters.platform_name,
+    account: filters.account,
+    target_host: filters.target_host,
+    egress_ip: filters.egress_ip,
+    http_status: filters.http_status,
+  };
+}
+
 function proxyTypeLabel(proxyType: number): string {
   if (proxyType === 1) {
     return "HTTP 正向代理";
@@ -348,6 +361,9 @@ function splitDateTime(input: string): { date: string; time: string } {
 export function RequestLogsPage() {
   const { t } = useI18n();
   const [filters, setFilters] = useState<FilterDraft>(defaultFilters);
+  const [debouncedTextFilters, setDebouncedTextFilters] = useState<DebouncedTextFilters>(() =>
+    pickDebouncedTextFilters(defaultFilters),
+  );
   const [cursorStack, setCursorStack] = useState<string[]>([""]);
   const [pageIndex, setPageIndex] = useState(0);
   const [selectedLogId, setSelectedLogId] = useState("");
@@ -366,7 +382,38 @@ export function RequestLogsPage() {
     staleTime: 60_000,
   });
 
-  const activeFilters = useMemo(() => buildActiveFilters(filters), [filters]);
+  useEffect(() => {
+    const timeoutID = window.setTimeout(() => {
+      setDebouncedTextFilters({
+        platform_name: filters.platform_name,
+        account: filters.account,
+        target_host: filters.target_host,
+        egress_ip: filters.egress_ip,
+        http_status: filters.http_status,
+      });
+    }, FILTER_DEBOUNCE_MS);
+    return () => window.clearTimeout(timeoutID);
+  }, [filters.account, filters.egress_ip, filters.http_status, filters.platform_name, filters.target_host]);
+
+  const queryFilters = useMemo<FilterDraft>(
+    () => ({
+      from_local: filters.from_local,
+      to_local: filters.to_local,
+      proxy_type: filters.proxy_type,
+      net_ok: filters.net_ok,
+      limit: filters.limit,
+      ...debouncedTextFilters,
+    }),
+    [
+      debouncedTextFilters,
+      filters.from_local,
+      filters.limit,
+      filters.net_ok,
+      filters.proxy_type,
+      filters.to_local,
+    ],
+  );
+  const activeFilters = useMemo(() => buildActiveFilters(queryFilters), [queryFilters]);
   const cursor = cursorStack[pageIndex] || "";
 
   const rangeInvalid = useMemo(() => {
@@ -447,6 +494,7 @@ export function RequestLogsPage() {
 
   const resetFilters = () => {
     setFilters(defaultFilters);
+    setDebouncedTextFilters(pickDebouncedTextFilters(defaultFilters));
     setCursorStack([""]);
     setPageIndex(0);
     setSelectedLogId("");
@@ -878,6 +926,7 @@ export function RequestLogsPage() {
             onRowClick={(log) => openDrawer(log.id)}
             selectedRowId={drawerVisible ? detailLogId : undefined}
             getRowId={(log) => log.id}
+            className="data-table-logs"
             wrapClassName="data-table-wrap-logs"
           />
         ) : null}

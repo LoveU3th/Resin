@@ -2016,9 +2016,13 @@ func parseProxyURI(uri string) (ParsedNode, bool) {
 		return ParsedNode{}, false
 	}
 	tag := decodeTag(u.Fragment)
+	defaultTagProto := nodeType
+	if scheme == "https" {
+		defaultTagProto = scheme
+	}
 	outbound := map[string]any{
 		"type":        nodeType,
-		"tag":         defaultTag(tag, nodeType, server, port),
+		"tag":         defaultTag(tag, defaultTagProto, server, port),
 		"server":      server,
 		"server_port": port,
 	}
@@ -2804,17 +2808,21 @@ func parseVmessFromMap(v map[string]any, fallbackTag string) (ParsedNode, bool) 
 }
 
 func vmessNetworkFromMap(v map[string]any) string {
-	network := strings.ToLower(strings.TrimSpace(firstNonEmpty(
+	network := normalizeV2RayNetwork(firstNonEmpty(
 		getString(v, "net"),
 		getString(v, "network"),
-	)))
+	))
+	candidate := strings.ToLower(strings.TrimSpace(getString(v, "type")))
+	// VMess TCP/RAW exports use type=http for HTTP header obfuscation.
+	if (network == "" || network == "tcp") && candidate == "http" {
+		return "http"
+	}
 	if network != "" {
 		return network
 	}
 
 	// Some exports place transport under `type`, but in standard vmess JSON
 	// `type` is often a header mode (`none/http`) rather than transport.
-	candidate := strings.ToLower(strings.TrimSpace(getString(v, "type")))
 	switch normalizeV2RayNetwork(candidate) {
 	case "ws", "grpc", "h2", "quic", "httpupgrade", "kcp":
 		return candidate
@@ -4368,6 +4376,18 @@ func setWSPathAndEarlyData(transport map[string]any, rawPath string) {
 }
 
 func buildParsedNode(outbound map[string]any) (ParsedNode, bool) {
+	// uTLS only implements TCP TLS. QUIC clients require a standard TLS config,
+	// so ignore fingerprints when converting subscriptions to QUIC outbounds.
+	if tls, ok := getMap(outbound, "tls"); ok {
+		switch outbound["type"] {
+		case "hysteria", "hysteria2", "tuic":
+			delete(tls, "utls")
+		default:
+			if transport, ok := getMap(outbound, "transport"); ok && transport["type"] == "quic" {
+				delete(tls, "utls")
+			}
+		}
+	}
 	raw, err := json.Marshal(outbound)
 	if err != nil {
 		return ParsedNode{}, false

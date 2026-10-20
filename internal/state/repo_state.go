@@ -365,6 +365,148 @@ func (r *StateRepo) ListSubscriptions() ([]model.Subscription, error) {
 	return result, rows.Err()
 }
 
+// --- endpoints ---
+
+// InsertEndpoint persists a new custom endpoint.
+func (r *StateRepo) InsertEndpoint(endpoint model.Endpoint) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	_, err := r.db.Exec(`
+		INSERT INTO endpoints (
+			id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
+			allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, endpoint.ID, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
+		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
+		endpoint.AllowSOCKS5, endpoint.CreatedAtNs, endpoint.UpdatedAtNs)
+	if isSQLiteUniqueConstraint(err) {
+		return fmt.Errorf("%w: endpoint id or port already exists", ErrConflict)
+	}
+	return err
+}
+
+// UpdateEndpoint replaces the mutable fields of an existing custom endpoint.
+func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result, err := r.db.Exec(`
+		UPDATE endpoints SET
+			port = ?,
+			enabled = ?,
+			allow_management = ?,
+			allow_proxy = ?,
+			require_proxy_auth_info = ?,
+			allow_http_forward = ?,
+			allow_http_reverse = ?,
+			allow_socks5 = ?,
+			updated_at_ns = ?
+		WHERE id = ?
+	`, endpoint.Port, endpoint.Enabled, endpoint.AllowManagement, endpoint.AllowProxy,
+		endpoint.RequireProxyAuthInfo, endpoint.AllowHTTPForward, endpoint.AllowHTTPReverse,
+		endpoint.AllowSOCKS5, endpoint.UpdatedAtNs, endpoint.ID)
+	if isSQLiteUniqueConstraint(err) {
+		return fmt.Errorf("%w: endpoint port already exists", ErrConflict)
+	}
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteEndpoint removes a custom endpoint by ID.
+func (r *StateRepo) DeleteEndpoint(id string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	result, err := r.db.Exec("DELETE FROM endpoints WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetEndpoint returns one persisted custom endpoint.
+func (r *StateRepo) GetEndpoint(id string) (*model.Endpoint, error) {
+	row := r.db.QueryRow(`
+		SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
+		       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
+		FROM endpoints WHERE id = ?
+	`, id)
+	endpoint, err := scanEndpoint(row.Scan)
+	if err == sql.ErrNoRows {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &endpoint, nil
+}
+
+// ListEndpoints returns all persisted custom endpoints ordered by port.
+func (r *StateRepo) ListEndpoints() ([]model.Endpoint, error) {
+	rows, err := r.db.Query(`
+		SELECT id, port, enabled, allow_management, allow_proxy, require_proxy_auth_info,
+		       allow_http_forward, allow_http_reverse, allow_socks5, created_at_ns, updated_at_ns
+		FROM endpoints ORDER BY port ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]model.Endpoint, 0)
+	for rows.Next() {
+		endpoint, scanErr := scanEndpoint(rows.Scan)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, endpoint)
+	}
+	return result, rows.Err()
+}
+
+type endpointScanner func(dest ...any) error
+
+func scanEndpoint(scan endpointScanner) (model.Endpoint, error) {
+	var endpoint model.Endpoint
+	var enabled, allowManagement, allowProxy, requireProxyAuthInfo int
+	var allowHTTPForward, allowHTTPReverse, allowSOCKS5 int
+	err := scan(
+		&endpoint.ID,
+		&endpoint.Port,
+		&enabled,
+		&allowManagement,
+		&allowProxy,
+		&requireProxyAuthInfo,
+		&allowHTTPForward,
+		&allowHTTPReverse,
+		&allowSOCKS5,
+		&endpoint.CreatedAtNs,
+		&endpoint.UpdatedAtNs,
+	)
+	if err != nil {
+		return model.Endpoint{}, err
+	}
+	endpoint.Enabled = enabled != 0
+	endpoint.AllowManagement = allowManagement != 0
+	endpoint.AllowProxy = allowProxy != 0
+	endpoint.RequireProxyAuthInfo = requireProxyAuthInfo != 0
+	endpoint.AllowHTTPForward = allowHTTPForward != 0
+	endpoint.AllowHTTPReverse = allowHTTPReverse != 0
+	endpoint.AllowSOCKS5 = allowSOCKS5 != 0
+	return endpoint, nil
+}
+
 // --- account_header_rules ---
 
 // EnsureAccountHeaderRule inserts a rule by url_prefix only when it does not

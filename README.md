@@ -28,6 +28,7 @@ It helps shield your services from unstable underlying proxy nodes by aggregatin
 - **Smart scheduling and circuit breaking**: Fully automated **passive + active** health checks, outbound IP probing, and latency analysis to remove bad nodes precisely. Uses P2C plus domain-aware latency-weighted scoring for optimal node selection.
 - **Business-friendly sticky proxying**: Keeps the same business account bound to a stable outbound IP. If a node fails, Resin seamlessly switches to another node with the same IP.
 - **Multiple access modes**: Supports HTTP forward proxy, SOCKS5 forward proxy, and URL-based reverse proxy for different clients and integration styles.
+- **Multiple inbound endpoints**: Add hot-reloaded listening ports in the WebUI and independently control admin-console, HTTP forward, HTTP reverse, and SOCKS5 access on each port.
 - **Observability**: Detailed metrics and logs, plus a visual Web UI. Includes complete structured request logs for querying and auditing by platform, account, target site, and more.
 - **Simple and powerful**: Works out of the box with default settings, while still offering deep customization for enterprise-grade needs.
 - **Cross-subscription deduplication**: Automatically merges identical nodes from different subscriptions and shares their health state.
@@ -81,7 +82,6 @@ services:
     container_name: resin
     restart: unless-stopped
     environment:
-      RESIN_AUTH_VERSION: "V1" # Required: LEGACY_V0 or V1
       RESIN_ADMIN_TOKEN: "admin123" # Change to your admin dashboard password
       RESIN_PROXY_TOKEN: "my-token" # Change to your proxy password
       RESIN_LISTEN_ADDRESS: 0.0.0.0
@@ -95,6 +95,8 @@ services:
 ```
 
 Run `docker compose up -d` to start the service.
+
+Custom endpoint ports must also be reachable from outside the container. Docker cannot add published ports to an already-running container, so pre-publish the required port range in `ports` (for example `"2300-2399:2300-2399"`) or use host networking where appropriate.
 
 *(If you don't want Docker, jump to [Other Deployment Options](#other-deployment-options).)*
 
@@ -127,7 +129,7 @@ curl -x http://127.0.0.1:2260 \
   https://api.ipify.org
 ```
 
-SOCKS5 forward proxy example (available only when `RESIN_AUTH_VERSION=V1`):
+SOCKS5 forward proxy example:
 
 ```bash
 curl --proxy socks5h://127.0.0.1:2260 \
@@ -135,7 +137,7 @@ curl --proxy socks5h://127.0.0.1:2260 \
   https://api.ipify.org
 ```
 
-If you are still running `LEGACY_V0`, SOCKS5 inbound is not enabled. Keep using HTTP forward proxy, or complete migration before switching to `V1`. When `RESIN_PROXY_TOKEN=""`, SOCKS5 also allows unauthenticated access.
+When `RESIN_PROXY_TOKEN=""`, SOCKS5 also allows unauthenticated access.
 
 If your client supports overriding `BASE_URL`, you can also use reverse-proxy mode.
 URL format: `/token/Platform(optional).Account(optional)/protocol/target`.
@@ -157,6 +159,18 @@ Open `http://127.0.0.1:2260/ui/platforms` and create a Platform. For example, to
 us
 hk
 ```
+
+Node tag rules match `<SubscriptionName>/<NodeTag>`, with one regular expression per line. Plain rules are ORed, a leading `*` marks a required rule, and a leading `!` excludes a node on any match. For example, this selects dedicated Hong Kong or Japan nodes while excluding expired and invalid nodes:
+
+```text
+Hong Kong
+Japan
+*Dedicated
+!Expired
+!Invalid
+```
+
+Only the first character is interpreted as a rule prefix; the rest remains a Go regular expression. Escape a literal leading `!` as `\!`.
 
 For forward proxy (HTTP / SOCKS5), include Platform in the auth info. Examples:
 
@@ -193,9 +207,7 @@ First, understand two core concepts:
 
 #### Method 1: Forward proxy (HTTP Proxy / SOCKS5)
 
-With `RESIN_AUTH_VERSION=V1`, HTTP forward proxy and SOCKS5 forward proxy share the same identity format: `Platform.Account:RESIN_PROXY_TOKEN`.
-
-> To keep the legacy V0 format, set `RESIN_AUTH_VERSION=LEGACY_V0` and continue using `RESIN_PROXY_TOKEN:Platform:Account`. SOCKS5 forward proxy is not enabled in that mode.
+HTTP forward proxy and SOCKS5 forward proxy share the same identity format: `Platform.Account:RESIN_PROXY_TOKEN`.
 
 Just put the identity in proxy authentication:
 
@@ -280,7 +292,7 @@ Different clients integrate Resin differently, with different code-intrusion lev
 
 | Access Method | Code Intrusion | Notes |
 | :--- | :--- | :--- |
-| Forward proxy | 🟡 **Medium intrusion** | Per-user requests need different auth info. Under V1, both HTTP and SOCKS5 can use `platform.account:token`. |
+| Forward proxy | 🟡 **Medium intrusion** | Per-user requests need different auth info. Both HTTP and SOCKS5 use `platform.account:token`. |
 | Reverse proxy | 🟡 **Medium intrusion** | Add `X-Resin-Account` request header or build reverse-proxy URL paths dynamically with account information. |
 | Reverse proxy + header rules | 🟢 **Zero/low intrusion** | Resin can extract Account from original headers (for example `Authorization`) and bind IP automatically. |
 
@@ -300,7 +312,6 @@ Go to the project's <a href="https://github.com/Resinat/Resin/releases">Release<
 
 ```bash
 RESIN_ADMIN_TOKEN=<admin-dashboard-password> \
-RESIN_AUTH_VERSION=V1 \
 RESIN_PROXY_TOKEN=<proxy-password> \
 RESIN_STATE_DIR=./data/state \
 RESIN_CACHE_DIR=./data/cache \
@@ -313,7 +324,6 @@ RESIN_PORT=2260 \
 Alternatively, create a `.env` file in the working directory and run `./resin`:
 
 ```dotenv
-RESIN_AUTH_VERSION=V1
 RESIN_ADMIN_TOKEN=<admin-dashboard-password>
 RESIN_PROXY_TOKEN=<proxy-password>
 RESIN_STATE_DIR=./data/state
@@ -343,7 +353,6 @@ go build -tags "with_quic with_wireguard with_grpc with_utls" -o resin ./cmd/res
 
 # 4. Run
 RESIN_ADMIN_TOKEN=<admin-dashboard-password> \
-RESIN_AUTH_VERSION=V1 \
 RESIN_PROXY_TOKEN=<proxy-password> \
 RESIN_STATE_DIR=./data/state \
 RESIN_CACHE_DIR=./data/cache \
@@ -381,10 +390,10 @@ These control outbound timeouts, metric retention, and request-level failover.
   - **A**: Set `RESIN_FORWARD_STICKY_ACCOUNT`. When a forward-proxy (HTTP or SOCKS5) request carries no Account in its credentials, Resin derives the sticky account from the target: `HOST` sticks on the target host (port stripped, lowercased), `DOMAIN` sticks on the target registrable domain (Public Suffix List ICANN rules only, so `raw.`/`camo.`/`avatars.githubusercontent.com` all collapse to `githubusercontent.com`) so all subdomains of one site share an egress IP, and `OFF` (default) keeps per-request random routing. An Account explicitly carried by the client credentials always wins; reverse-proxy account extraction is unaffected.
 - **Q: Startup fails with `RESIN_PROXY_TOKEN` undefined?**
   - **A**: Even if you do not want a proxy password, you must explicitly set it to empty: `RESIN_PROXY_TOKEN=""`. On shells that drop empty environment variables, create a `.env` file with `RESIN_PROXY_TOKEN=`.
-- **Q: Startup fails with `RESIN_AUTH_VERSION` undefined?**
-  - **A**: Set it to `LEGACY_V0` or `V1`. For new deployments, use `V1`. For upgrades with legacy data, see [doc/v1.0.0-migration-guide.md](doc/v1.0.0-migration-guide.md).
+- **Q: Why does Resin reject `RESIN_AUTH_VERSION=LEGACY_V0`?**
+  - **A**: `LEGACY_V0` is no longer supported. Remove `RESIN_AUTH_VERSION` or set it to `V1`. If you are upgrading from a release that used legacy authentication, see the [v1.0.0 auth migration guide](doc/v1.0.0-migration-guide.md).
 - **Q: Why can't my SOCKS5 client connect?**
-  - **A**: First confirm that you are running with `RESIN_AUTH_VERSION=V1`; SOCKS5 inbound is not enabled under `LEGACY_V0`. If `RESIN_PROXY_TOKEN` is non-empty, the client must send SOCKS5 username/password authentication. If it is explicitly set to an empty string, `NO AUTH` is also allowed.
+  - **A**: If `RESIN_PROXY_TOKEN` is non-empty, the client must send SOCKS5 username/password authentication. If it is explicitly set to an empty string, `NO AUTH` is also allowed.
 - **Q: How to write reverse-proxy paths for WebSocket (ws/wss)?**
   - **A**: In the URL path, the protocol field must still be `http` or `https` (not `ws`/`wss`). Resin auto-detects and handles WebSocket upgrade.
 

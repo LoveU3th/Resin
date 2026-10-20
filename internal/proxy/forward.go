@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
@@ -21,7 +20,6 @@ import (
 // ForwardProxyConfig holds dependencies for the forward proxy.
 type ForwardProxyConfig struct {
 	ProxyToken        string
-	AuthVersion       string
 	Router            *routing.Router
 	Pool              outbound.PoolAccessor
 	Health            HealthRecorder
@@ -42,7 +40,6 @@ type ForwardProxyConfig struct {
 // authentication, HTTP request forwarding, and CONNECT tunneling.
 type ForwardProxy struct {
 	token               string
-	authVersion         config.AuthVersion
 	router              *routing.Router
 	pool                outbound.PoolAccessor
 	health              HealthRecorder
@@ -69,14 +66,9 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 	if transportPool == nil {
 		transportPool = NewOutboundTransportPool(transportCfg)
 	}
-	authVersion := config.NormalizeAuthVersion(cfg.AuthVersion)
-	if authVersion == "" {
-		authVersion = config.AuthVersionLegacyV0
-	}
 	stickyAccountSource, _ := platform.NormalizeForwardStickyAccount(cfg.StickyAccountSource)
 	return &ForwardProxy{
 		token:               cfg.ProxyToken,
-		authVersion:         authVersion,
 		router:              cfg.Router,
 		pool:                cfg.Pool,
 		health:              cfg.Health,
@@ -123,72 +115,9 @@ func (p *ForwardProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *ForwardProxy) effectiveAuthVersion() config.AuthVersion {
-	if p == nil {
-		return config.AuthVersionLegacyV0
-	}
-	if p.authVersion == config.AuthVersionV1 {
-		return config.AuthVersionV1
-	}
-	return config.AuthVersionLegacyV0
-}
-
 // authenticate parses Proxy-Authorization and returns (platformName, account, error).
 func (p *ForwardProxy) authenticate(r *http.Request) (string, string, *ProxyError) {
-	if p.effectiveAuthVersion() == config.AuthVersionV1 {
-		return p.authenticateV1(r)
-	}
-	return p.authenticateLegacy(r)
-}
-
-func (p *ForwardProxy) authenticateLegacy(r *http.Request) (string, string, *ProxyError) {
-	auth := r.Header.Get("Proxy-Authorization")
-
-	// Empty configured proxy token means auth is intentionally disabled.
-	// In this mode, Proxy-Authorization is optional; when present and parseable,
-	// we still extract Platform:Account identity.
-	// Accepted credential formats in Basic payload:
-	// 1) "platform:account" (two fields)
-	// 2) "token:platform:account" (legacy three-field shape)
-	if p.token == "" {
-		platName, account, ok := parseProxyAuthorizationIdentityWhenAuthDisabledLegacy(auth)
-		if !ok {
-			return "", "", nil
-		}
-		return platName, account, nil
-	}
-
-	user, pass, ok := parseProxyAuthorizationLegacy(auth)
-	if !ok {
-		return "", "", ErrAuthRequired
-	}
-	if user != p.token {
-		return "", "", ErrAuthFailed
-	}
-
-	platName, account := parseLegacyPlatformAccountIdentity(pass)
-	return platName, account, nil
-}
-
-// parseProxyAuthorizationLegacy parses legacy Basic payload:
-// "PROXY_TOKEN:Platform:Account".
-//
-// This parser is intentionally legacy-only and must not be reused by V1 code.
-func parseProxyAuthorizationLegacy(auth string) (user string, pass string, ok bool) {
-	credential, ok := parseProxyAuthorizationCredentialLegacy(auth)
-	if !ok {
-		return "", "", false
-	}
-
-	// Legacy format: user:pass where user=PROXY_TOKEN, pass=Platform:Account.
-	// Split on first ":" to get user and pass.
-	colonIdx := strings.IndexByte(credential, ':')
-	if colonIdx < 0 {
-		return "", "", false
-	}
-	user = credential[:colonIdx]
-	pass = credential[colonIdx+1:]
-	return user, pass, true
+	return p.authenticateV1(r)
 }
 
 func (p *ForwardProxy) authenticateV1(r *http.Request) (string, string, *ProxyError) {
@@ -196,7 +125,13 @@ func (p *ForwardProxy) authenticateV1(r *http.Request) (string, string, *ProxyEr
 	if p.token == "" {
 		credential, ok := parseProxyAuthorizationCredentialV1(auth)
 		if !ok {
+			if requireProxyAuthInfo(r) {
+				return "", "", ErrAuthRequired
+			}
 			return "", "", nil
+		}
+		if requireProxyAuthInfo(r) && !hasBasicUserInfo(credential) {
+			return "", "", ErrAuthRequired
 		}
 		platName, account := parseForwardCredentialV1WhenAuthDisabled(credential)
 		return platName, account, nil
@@ -213,42 +148,17 @@ func (p *ForwardProxy) authenticateV1(r *http.Request) (string, string, *ProxyEr
 	return platName, account, nil
 }
 
-func parseProxyAuthorizationIdentityWhenAuthDisabledLegacy(auth string) (platName string, account string, ok bool) {
-	credential, ok := parseProxyAuthorizationCredentialLegacy(auth)
-	if !ok {
-		return "", "", false
-	}
-	platName, account = parseLegacyAuthDisabledIdentityCredential(credential)
-	return platName, account, true
+func requireProxyAuthInfo(r *http.Request) bool {
+	return r != nil && InboundPolicyFromContext(r.Context()).RequireProxyAuthInfo
 }
 
-// parseProxyAuthorizationCredentialLegacy decodes Basic credential for
-// LEGACY_V0 forward-auth flows.
-//
-// This function intentionally duplicates V1 decoding logic so legacy and V1
-// parsing paths remain structurally isolated for future legacy removal.
-func parseProxyAuthorizationCredentialLegacy(auth string) (string, bool) {
-	if auth == "" {
-		return "", false
-	}
-
-	// Expect "<scheme> <base64>"; scheme is case-insensitive per RFC.
-	authFields := strings.Fields(auth)
-	if len(authFields) != 2 || !strings.EqualFold(authFields[0], "Basic") {
-		return "", false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(authFields[1])
-	if err != nil {
-		return "", false
-	}
-	return string(decoded), true
+func hasBasicUserInfo(credential string) bool {
+	separator := strings.LastIndexByte(credential, ':')
+	return separator > 0
 }
 
 // parseProxyAuthorizationCredentialV1 decodes Basic credential for V1
 // forward-auth flows.
-//
-// This function intentionally duplicates legacy decoding logic so V1 remains
-// independent from LEGACY_V0 parser implementation.
 func parseProxyAuthorizationCredentialV1(auth string) (string, bool) {
 	if auth == "" {
 		return "", false

@@ -32,6 +32,10 @@ import type { Subscription } from "./types";
 
 type EnabledFilter = "all" | "enabled" | "disabled";
 type SubscriptionSourceType = "remote" | "local";
+type SubscriptionEnabledMutation = {
+  subscription: Subscription;
+  enabled: boolean;
+};
 
 const SUBSCRIPTION_SOURCE_TABS: Array<{ key: SubscriptionSourceType; label: string; hint: string }> = [
   { key: "remote", label: "远程", hint: "从 HTTP/HTTPS 订阅链接拉取内容" },
@@ -130,8 +134,10 @@ export function SubscriptionPage() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [pendingRefreshIds, setPendingRefreshIds] = useState<Set<string>>(() => new Set());
+  const [pendingEnabledStates, setPendingEnabledStates] = useState<ReadonlyMap<string, boolean>>(() => new Map());
   const { toasts, showToast, dismissToast } = useToast();
   const pendingRefreshIdsRef = useRef<Set<string>>(new Set());
+  const pendingEnabledStatesRef = useRef<Map<string, boolean>>(new Map());
 
   const queryClient = useQueryClient();
   const enabledValue = parseEnabledFilter(enabledFilter);
@@ -332,6 +338,24 @@ export function SubscriptionPage() {
   });
   const refreshSubscriptionMutateAsync = refreshMutation.mutateAsync;
 
+  const toggleEnabledMutation = useMutation({
+    mutationFn: ({ subscription, enabled }: SubscriptionEnabledMutation) =>
+      updateSubscription(subscription.id, { enabled }),
+    onSuccess: async (updated, { enabled }) => {
+      await invalidateSubscriptionsAndNodes();
+      showToast(
+        "success",
+        enabled
+          ? t("订阅 {{name}} 已启用", { name: updated.name })
+          : t("订阅 {{name}} 已禁用", { name: updated.name }),
+      );
+    },
+    onError: (error) => {
+      showToast("error", formatApiErrorMessage(error, t));
+    },
+  });
+  const toggleSubscriptionEnabledMutateAsync = toggleEnabledMutation.mutateAsync;
+
   const markRefreshPending = useCallback((subscriptionId: string): boolean => {
     if (pendingRefreshIdsRef.current.has(subscriptionId)) {
       return false;
@@ -354,6 +378,37 @@ export function SubscriptionPage() {
   }, []);
 
   const isRefreshPending = useCallback((subscriptionId: string): boolean => pendingRefreshIds.has(subscriptionId), [pendingRefreshIds]);
+
+  const markEnabledTogglePending = useCallback((subscriptionId: string, enabled: boolean): boolean => {
+    if (pendingEnabledStatesRef.current.has(subscriptionId)) {
+      return false;
+    }
+    const next = new Map(pendingEnabledStatesRef.current);
+    next.set(subscriptionId, enabled);
+    pendingEnabledStatesRef.current = next;
+    setPendingEnabledStates(next);
+    return true;
+  }, []);
+
+  const clearEnabledTogglePending = useCallback((subscriptionId: string) => {
+    if (!pendingEnabledStatesRef.current.has(subscriptionId)) {
+      return;
+    }
+    const next = new Map(pendingEnabledStatesRef.current);
+    next.delete(subscriptionId);
+    pendingEnabledStatesRef.current = next;
+    setPendingEnabledStates(next);
+  }, []);
+
+  const isEnabledTogglePending = useCallback(
+    (subscriptionId: string): boolean => pendingEnabledStates.has(subscriptionId),
+    [pendingEnabledStates],
+  );
+
+  const displayedEnabledState = useCallback(
+    (subscription: Subscription): boolean => pendingEnabledStates.get(subscription.id) ?? subscription.enabled,
+    [pendingEnabledStates],
+  );
 
   const cleanupCircuitOpenNodesMutation = useMutation({
     mutationFn: async (subscription: Subscription) => {
@@ -427,6 +482,19 @@ export function SubscriptionPage() {
     }
   }, [clearRefreshPending, markRefreshPending, refreshSubscriptionMutateAsync]);
 
+  const handleEnabledChange = useCallback(async (subscription: Subscription, enabled: boolean) => {
+    if (!markEnabledTogglePending(subscription.id, enabled)) {
+      return;
+    }
+    try {
+      await toggleSubscriptionEnabledMutateAsync({ subscription, enabled });
+    } catch {
+      // Mutation callbacks already surface the failure to the user.
+    } finally {
+      clearEnabledTogglePending(subscription.id);
+    }
+  }, [clearEnabledTogglePending, markEnabledTogglePending, toggleSubscriptionEnabledMutateAsync]);
+
   const changePageSize = (next: number) => {
     setPageSize(next);
     setPage(0);
@@ -472,17 +540,17 @@ export function SubscriptionPage() {
       }),
       col.display({
         id: "status",
-        header: t("状态"),
+        header: t("刷新状态"),
         cell: (info) => {
           const s = info.row.original;
           return (
             <div className="subscriptions-status-cell">
-              {!s.enabled ? (
-                <Badge variant="warning">{t("已禁用")}</Badge>
-              ) : s.last_error ? (
+              {s.last_error ? (
                 <Badge variant="danger">{t("错误")}</Badge>
-              ) : (
+              ) : s.last_checked ? (
                 <Badge variant="success">{t("正常")}</Badge>
+              ) : (
+                <Badge variant="muted">{t("未检查")}</Badge>
               )}
             </div>
           );
@@ -495,6 +563,27 @@ export function SubscriptionPage() {
       col.accessor("last_updated", {
         header: t("上次更新"),
         cell: (info) => formatRelativeTime(info.getValue() || ""),
+      }),
+      col.display({
+        id: "enabled",
+        header: t("启用"),
+        cell: (info) => {
+          const s = info.row.original;
+          const enabled = displayedEnabledState(s);
+          const toggleLabel = enabled
+            ? t("停用订阅 {{name}}", { name: s.name })
+            : t("启用订阅 {{name}}", { name: s.name });
+          return (
+            <div className="subscription-enabled-cell" title={toggleLabel} onClick={(event) => event.stopPropagation()}>
+              <Switch
+                checked={enabled}
+                disabled={isEnabledTogglePending(s.id)}
+                onChange={(event) => void handleEnabledChange(s, event.target.checked)}
+                aria-label={toggleLabel}
+              />
+            </div>
+          );
+        },
       }),
       col.display({
         id: "actions",
@@ -538,7 +627,18 @@ export function SubscriptionPage() {
         },
       }),
     ],
-    [col, handleDelete, handleRefresh, isDeletePending, isRefreshPending, openDrawer, t]
+    [
+      col,
+      displayedEnabledState,
+      handleDelete,
+      handleEnabledChange,
+      handleRefresh,
+      isDeletePending,
+      isEnabledTogglePending,
+      isRefreshPending,
+      openDrawer,
+      t,
+    ]
   );
 
   return (
@@ -661,9 +761,6 @@ export function SubscriptionPage() {
                 <p>{selectedSubscription.id}</p>
               </div>
               <div className="drawer-header-actions">
-                <Badge variant={selectedSubscription.enabled ? "success" : "warning"}>
-                  {selectedSubscription.enabled ? t("运行中") : t("已停用")}
-                </Badge>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -708,6 +805,21 @@ export function SubscriptionPage() {
 
                 <form className="form-grid" onSubmit={onEditSubmit}>
                   <input type="hidden" {...editForm.register("source_type")} />
+
+                  <div className="subscription-switch-item field-span-2">
+                    <label className="subscription-switch-label" htmlFor="edit-sub-enabled">
+                      <span>{t("启用")}</span>
+                      <span
+                        className="subscription-info-icon"
+                        title={t(SUBSCRIPTION_DISABLE_HINT)}
+                        aria-label={t(SUBSCRIPTION_DISABLE_HINT)}
+                        tabIndex={0}
+                      >
+                        <Info size={13} />
+                      </span>
+                    </label>
+                    <Switch id="edit-sub-enabled" {...editForm.register("enabled")} />
+                  </div>
 
                   <div className="field-group">
                     <label className="field-label" htmlFor="edit-sub-name">
@@ -836,26 +948,6 @@ export function SubscriptionPage() {
                     ) : null}
                   </div>
 
-                  <div className="field-group">
-                    <label className="field-label" htmlFor="edit-sub-enabled" style={{ visibility: "hidden" }}>
-                      {t("启用")}
-                    </label>
-                    <div className="subscription-switch-item">
-                      <label className="subscription-switch-label" htmlFor="edit-sub-enabled">
-                        <span>{t("启用")}</span>
-                        <span
-                          className="subscription-info-icon"
-                          title={t(SUBSCRIPTION_DISABLE_HINT)}
-                          aria-label={t(SUBSCRIPTION_DISABLE_HINT)}
-                          tabIndex={0}
-                        >
-                          <Info size={13} />
-                        </span>
-                      </label>
-                      <Switch id="edit-sub-enabled" {...editForm.register("enabled")} />
-                    </div>
-                  </div>
-
                   <div className="platform-config-actions">
                     <Button type="submit" disabled={updateMutation.isPending}>
                       {updateMutation.isPending ? t("保存中...") : t("保存配置")}
@@ -930,6 +1022,21 @@ export function SubscriptionPage() {
 
             <form className="form-grid" onSubmit={onCreateSubmit}>
               <input type="hidden" {...createForm.register("source_type")} />
+
+              <div className="subscription-switch-item field-span-2">
+                <label className="subscription-switch-label" htmlFor="create-sub-enabled">
+                  <span>{t("启用")}</span>
+                  <span
+                    className="subscription-info-icon"
+                    title={t(SUBSCRIPTION_DISABLE_HINT)}
+                    aria-label={t(SUBSCRIPTION_DISABLE_HINT)}
+                    tabIndex={0}
+                  >
+                    <Info size={13} />
+                  </span>
+                </label>
+                <Switch id="create-sub-enabled" {...createForm.register("enabled")} />
+              </div>
 
               <div className="field-group field-span-2">
                 <label className="field-label" htmlFor="create-sub-name">
@@ -1070,26 +1177,6 @@ export function SubscriptionPage() {
                 {createForm.formState.errors.ephemeral_node_evict_delay?.message ? (
                   <p className="field-error">{t(createForm.formState.errors.ephemeral_node_evict_delay.message)}</p>
                 ) : null}
-              </div>
-
-              <div className="field-group">
-                <label className="field-label" htmlFor="create-sub-enabled" style={{ visibility: "hidden" }}>
-                  {t("启用")}
-                </label>
-                <div className="subscription-switch-item">
-                  <label className="subscription-switch-label" htmlFor="create-sub-enabled">
-                    <span>{t("启用")}</span>
-                    <span
-                      className="subscription-info-icon"
-                      title={t(SUBSCRIPTION_DISABLE_HINT)}
-                      aria-label={t(SUBSCRIPTION_DISABLE_HINT)}
-                      tabIndex={0}
-                    >
-                      <Info size={13} />
-                    </span>
-                  </label>
-                  <Switch id="create-sub-enabled" {...createForm.register("enabled")} />
-                </div>
               </div>
 
               <div className="detail-actions" style={{ justifyContent: "flex-end" }}>

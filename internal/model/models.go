@@ -34,6 +34,22 @@ type Subscription struct {
 	UpdatedAtNs               int64  `json:"updated_at_ns"`
 }
 
+// Endpoint represents a persisted custom inbound listener. The environment-
+// defined default endpoint is synthesized at runtime and is never stored here.
+type Endpoint struct {
+	ID                   string `json:"id"`
+	Port                 int    `json:"port"`
+	Enabled              bool   `json:"enabled"`
+	AllowManagement      bool   `json:"allow_management"`
+	AllowProxy           bool   `json:"allow_proxy"`
+	RequireProxyAuthInfo bool   `json:"require_proxy_auth_info"`
+	AllowHTTPForward     bool   `json:"allow_http_forward"`
+	AllowHTTPReverse     bool   `json:"allow_http_reverse"`
+	AllowSOCKS5          bool   `json:"allow_socks5"`
+	CreatedAtNs          int64  `json:"created_at_ns"`
+	UpdatedAtNs          int64  `json:"updated_at_ns"`
+}
+
 // AccountHeaderRule defines header extraction rules for reverse proxy account matching.
 type AccountHeaderRule struct {
 	URLPrefix   string `json:"url_prefix"`

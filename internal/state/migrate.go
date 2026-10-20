@@ -25,6 +25,10 @@ const (
 	stateVersionNormalizeMissAction              = 4
 	stateVersionAddIncrementalAliveNodes         = 5
 	stateVersionAddPassiveCircuitBreakerDisabled = 6
+	stateVersionAddEndpoints                     = 7
+	stateVersionAddEndpointEnabled               = 8
+	stateVersionPlatformRegexFilterRules         = 9
+	stateLatestVersion                           = stateVersionPlatformRegexFilterRules
 	stateLegacyBaselineVersion                   = stateVersionAddFixedAccountHeader
 
 	stateBaseSchemaMigration = stateMigrationsPath + "/000001_state_base.up.sql"

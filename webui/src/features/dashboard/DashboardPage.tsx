@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Gauge, Layers, Server, Shield, Waves } from "lucide-react";
-import { useId, useMemo, useState } from "react";
-import { Area, Bar, BarChart, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { useEffect, useId, useMemo, useState, type ComponentProps } from "react";
+import { Area, Bar, BarChart, CartesianGrid, ComposedChart, Curve, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Badge } from "../../components/ui/Badge";
 import { Card } from "../../components/ui/Card";
 import { Select } from "../../components/ui/Select";
@@ -16,6 +16,7 @@ import {
   getDashboardGlobalSnapshotData,
 } from "./api";
 import type { DashboardGlobalData, LatencyBucket, TimeWindow } from "./types";
+import { aggregateTrendInput, getThroughputAxisMax, getTrendBucketWidth, type TrendPoint } from "./trend-aggregation";
 
 type RangeKey = "15m" | "1h" | "6h" | "24h";
 
@@ -27,6 +28,7 @@ type RangeOption = {
 
 type ChartSeries = {
   name: string;
+  tooltipName?: string;
   values: number[];
   color: string;
   fillColor?: string;
@@ -36,30 +38,15 @@ type TrendChartProps = {
   labels: string[];
   series: ChartSeries[];
   formatYAxisLabel?: (value: number) => string;
-};
-
-type TrendSeries = ChartSeries & {
-  key: string;
-};
-
-type TrendPoint = {
-  rawLabel: string;
-  displayLabel: string;
-  sortKey: number;
-  order: number;
-  [key: string]: number | string;
-};
-
-type TrendTooltipEntry = {
-  dataKey?: string | number;
-  value?: number | string;
+  formatTooltipValue?: (value: number) => string;
+  aggregationWindowMs?: number;
+  incompleteFrom?: number;
 };
 
 type TrendTooltipContentProps = {
   active?: boolean;
-  payload?: TrendTooltipEntry[];
-  label?: string;
-  series: TrendSeries[];
+  payload?: Array<{ payload?: TrendPoint }>;
+  series: ChartSeries[];
   valueFormatter: (value: number) => string;
 };
 
@@ -95,10 +82,14 @@ const SNAPSHOT_REFRESH_MS = 5_000;
 const MAX_TREND_POINTS = 480;
 const MAX_HISTOGRAM_BUCKETS = 120;
 
-function getTimeWindow(rangeKey: RangeKey): TimeWindow {
+function getRangeDurationMs(rangeKey: RangeKey): number {
   const option = RANGE_OPTIONS.find((item) => item.key === rangeKey) ?? RANGE_OPTIONS[1];
+  return option.ms;
+}
+
+function getTimeWindow(rangeKey: RangeKey): TimeWindow {
   const to = new Date();
-  const from = new Date(to.getTime() - option.ms);
+  const from = new Date(to.getTime() - getRangeDurationMs(rangeKey));
   return {
     from: from.toISOString(),
     to: to.toISOString(),
@@ -124,26 +115,15 @@ function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function formatBps(value: number): string {
-  const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+function formatBytesPerSecond(value: number, compact = false): string {
+  const units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
   let next = value;
   let unitIndex = 0;
   while (next >= 1000 && unitIndex < units.length - 1) {
     next /= 1000;
     unitIndex += 1;
   }
-  return `${next.toFixed(next >= 100 ? 0 : 1)} ${units[unitIndex]}`;
-}
-
-function formatShortBps(value: number): string {
-  const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
-  let next = value;
-  let unitIndex = 0;
-  while (next >= 1000 && unitIndex < units.length - 1) {
-    next /= 1000;
-    unitIndex += 1;
-  }
-  return `${next.toFixed(next >= 100 ? 0 : 1)}${units[unitIndex]}`;
+  return `${next.toFixed(next >= 100 ? 0 : 1)}${compact ? "" : " "}${units[unitIndex]}`;
 }
 
 function formatBytes(value: number): string {
@@ -241,35 +221,6 @@ function sortTimeSeriesByTimestamp<T>(items: T[], getTimestamp: (item: T) => str
       return left.sortKey - right.sortKey;
     })
     .map((entry) => entry.item);
-}
-
-function normalizeTrendData(labels: string[], series: TrendSeries[]): TrendPoint[] {
-  const pointCount = Math.max(labels.length, ...series.map((item) => item.values.length));
-
-  const points = Array.from({ length: pointCount }, (_, index) => {
-    const rawLabel = labels[index] ?? "";
-    const point: TrendPoint = {
-      rawLabel,
-      displayLabel: formatClock(rawLabel),
-      sortKey: parseTrendTimestamp(rawLabel, index),
-      order: index,
-    };
-
-    series.forEach((item) => {
-      point[item.key] = item.values[index] ?? 0;
-    });
-
-    return point;
-  });
-
-  points.sort((left, right) => {
-    if (left.sortKey === right.sortKey) {
-      return left.order - right.order;
-    }
-    return left.sortKey - right.sortKey;
-  });
-
-  return points;
 }
 
 function buildUniformSampleIndices(pointCount: number, maxPoints: number): number[] {
@@ -381,74 +332,116 @@ function buildM4SampleIndices(pointCount: number, series: ChartSeries[], maxPoin
   return sampledSelection.map((index) => selected[index] ?? selected[selected.length - 1]);
 }
 
-function downsampleTrendInput(
-  labels: string[],
-  series: ChartSeries[],
-  maxPoints: number,
-): { labels: string[]; series: ChartSeries[] } {
+function downsampleTrendInput(labels: string[], series: ChartSeries[], maxPoints: number, incompleteFrom?: number): TrendPoint[] {
+  series = sanitizeSeries(series);
   const pointCount = Math.max(labels.length, ...series.map((item) => item.values.length));
-  if (pointCount <= 0) {
-    return { labels, series };
-  }
-
-  const indices = buildM4SampleIndices(pointCount, series, maxPoints);
-  if (!indices.length || indices.length === pointCount) {
-    return { labels, series };
-  }
-
-  return {
-    labels: indices.map((index) => labels[index] ?? ""),
-    series: series.map((item) => ({
-      ...item,
-      values: indices.map((index) => item.values[index] ?? 0),
-    })),
-  };
+  const boundary = incompleteFrom === undefined ? -1 : labels.findIndex((label) => Date.parse(label) >= incompleteFrom);
+  const indices = buildM4SampleIndices(pointCount, series, maxPoints - (boundary > 0 ? 1 : 0));
+  // Retain the last complete bucket so the dashed segment starts at its actual neighbour.
+  if (boundary > 0 && !indices.includes(boundary - 1)) indices.push(boundary - 1);
+  return indices
+    .map((index) => ({
+      timestamp: parseTrendTimestamp(labels[index] ?? "", index),
+      values: series.map((item) => item.values[index] ?? 0),
+    }))
+    .sort((left, right) => left.timestamp - right.timestamp);
 }
 
-function TrendTooltipContent({ active, payload, label, series, valueFormatter }: TrendTooltipContentProps) {
-  if (!active || !payload?.length) {
+function incompleteBucketStart(items: Array<{ bucket_start: string; bucket_end: string }>, sampledAt?: number): number | undefined {
+  const bucket = sampledAt === undefined ? undefined : items.find((item) => Date.parse(item.bucket_end) > sampledAt);
+  return bucket ? Date.parse(bucket.bucket_start) : undefined;
+}
+
+function TrendTooltipContent({ active, payload, series, valueFormatter }: TrendTooltipContentProps) {
+  const { t } = useI18n();
+  const point = payload?.[0]?.payload;
+  if (!active || !point) {
     return null;
   }
+  const timeLabel = [point.timestamp, point.bucketEnd]
+    .filter((timestamp) => timestamp !== undefined)
+    .map((timestamp) => formatClock(new Date(timestamp).toISOString())).join(" – ");
+  const hasPeaks = Boolean(point.ranges);
 
   return (
     <div className="trend-tooltip">
-      <p className="trend-tooltip-time">{label ? formatClock(new Date(Number(label)).toISOString()) : "--"}</p>
-      <div className="trend-tooltip-list">
-        {series.map((item) => {
-          const entry = payload.find((payloadItem) => payloadItem.dataKey === item.key);
-          const value = Number(entry?.value ?? 0);
-          const safeValue = Number.isFinite(value) ? value : 0;
-
-          return (
-            <p key={item.key} className="trend-tooltip-row">
-              <span>
-                <i style={{ background: item.color }} />
-                {item.name}
-              </span>
-              <b>{valueFormatter(safeValue)}</b>
-            </p>
-          );
-        })}
-      </div>
+      <table className={`trend-tooltip-table${hasPeaks ? "" : " trend-tooltip-table-compact"}`}>
+        <thead>
+          <tr>
+            <td colSpan={hasPeaks ? 1 : 2}>{timeLabel}</td>
+            {hasPeaks && <>
+              <th scope="col">{t("平均")}</th>
+              <th scope="col">{t("峰值")}</th>
+            </>}
+          </tr>
+        </thead>
+        <tbody>
+          {series.map((item, index) => (
+            <tr key={index}>
+              <th scope="row">
+                <span className="trend-tooltip-series">
+                  <i style={{ background: item.color }} aria-hidden="true" />
+                  {item.tooltipName ?? item.name}
+                </span>
+              </th>
+              <td>{valueFormatter(point.values[index])}</td>
+              {point.ranges && <td>{valueFormatter(point.ranges[index][1])}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function TrendChart({ labels, series, formatYAxisLabel }: TrendChartProps) {
+function IncompleteBucketCurve({ boundary, ...props }: ComponentProps<typeof Curve> & { boundary: number }) {
+  const id = useId().replace(/:/g, "");
+  const splitX = props.points?.[Math.max(0, boundary - 1)]?.x;
+  if (typeof splitX !== "number") return <Curve {...props} />;
+
+  // Clip the same complete spline; splitting its input changes the end tangents.
+  return (
+    <>
+      <defs>
+        <clipPath id={`${id}-solid`}><rect width={splitX} height="100%" /></clipPath>
+        <clipPath id={`${id}-dashed`}><rect x={splitX} width="100%" height="100%" /></clipPath>
+      </defs>
+      <g clipPath={`url(#${id}-solid)`}><Curve {...props} /></g>
+      <g clipPath={`url(#${id}-dashed)`}><Curve {...props} strokeDasharray="4 3" /></g>
+    </>
+  );
+}
+
+function TrendChart({ labels, series, formatYAxisLabel, formatTooltipValue, aggregationWindowMs, incompleteFrom }: TrendChartProps) {
   const { t } = useI18n();
-  const safeSeries = sanitizeSeries(series);
-  const sampled = downsampleTrendInput(labels, safeSeries, MAX_TREND_POINTS);
+  const hasExtrema = aggregationWindowMs !== undefined;
+  const data = hasExtrema
+    ? aggregateTrendInput(labels, series, getTrendBucketWidth(aggregationWindowMs))
+    : downsampleTrendInput(labels, series, MAX_TREND_POINTS, incompleteFrom);
+  const targetMax = hasExtrema ? getThroughputAxisMax(data) : undefined;
+  const [scale, setScale] = useState({ windowMs: aggregationWindowMs, max: targetMax ?? 1 });
+  const sameWindow = scale.windowMs === aggregationWindowMs;
+  const upperBound = targetMax === undefined ? undefined : Math.max(targetMax, sameWindow ? scale.max : targetMax);
+  useEffect(() => {
+    if (targetMax === undefined) return;
+    const expand = !sameWindow || targetMax > scale.max;
+    // Ignore small changes; after a sustained fall, shrink at most 10% every 5s.
+    if (!expand && targetMax >= scale.max * 0.8) return;
+    const timer = window.setTimeout(() => setScale({
+      windowMs: aggregationWindowMs,
+      max: expand ? targetMax : Math.max(targetMax, scale.max * 0.9),
+    }), expand ? 0 : 5000);
+    return () => window.clearTimeout(timer);
+  }, [aggregationWindowMs, sameWindow, scale.max, targetMax]);
+  const boundary = incompleteFrom === undefined ? -1 : data.findIndex((point) => point.timestamp >= incompleteFrom);
   const yLabelFormatter = formatYAxisLabel ?? formatShortNumber;
-  const trendSeries: TrendSeries[] = sampled.series.map((item, index) => ({
-    ...item,
-    key: `series_${index}`,
-  }));
-  const data = normalizeTrendData(sampled.labels, trendSeries);
   const valueCount = data.length;
-  const firstLabel = data[0]?.displayLabel ?? "";
-  const lastLabel = data[valueCount - 1]?.displayLabel ?? "";
+  const firstLabel = valueCount ? formatClock(new Date(data[0].timestamp).toISOString()) : "";
+  const lastLabel = valueCount ? formatClock(new Date(data[valueCount - 1].timestamp).toISOString()) : "";
   const gradientSeed = useId().replace(/:/g, "");
-  const leadingSeries = trendSeries[0];
+  const leadingSeries = series[0];
+  const showGradient = !hasExtrema && leadingSeries?.fillColor;
+  const areaSeries = hasExtrema ? series : series.slice(0, showGradient ? 1 : 0);
   const gradientId = `trend-gradient-${gradientSeed}`;
   const chartMargin = {
     top: 6,
@@ -457,7 +450,7 @@ function TrendChart({ labels, series, formatYAxisLabel }: TrendChartProps) {
     left: 8,
   };
 
-  if (!valueCount || !trendSeries.length) {
+  if (!valueCount || !series.length) {
     return (
       <div className="empty-box dashboard-empty">
         <AlertTriangle size={14} />
@@ -471,7 +464,7 @@ function TrendChart({ labels, series, formatYAxisLabel }: TrendChartProps) {
       <div className="trend-svg">
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={data} margin={chartMargin}>
-            {leadingSeries?.fillColor ? (
+            {showGradient ? (
               <defs>
                 <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0%" stopColor={leadingSeries.fillColor} stopOpacity={0.92} />
@@ -481,7 +474,7 @@ function TrendChart({ labels, series, formatYAxisLabel }: TrendChartProps) {
             ) : null}
 
             <CartesianGrid stroke="rgba(65, 87, 121, 0.16)" strokeDasharray="2 4" vertical={false} />
-            <XAxis dataKey="sortKey" type="number" scale="time" domain={["dataMin", "dataMax"]} hide />
+            <XAxis dataKey="timestamp" type="number" scale="time" domain={["dataMin", "dataMax"]} hide />
             <YAxis
               width="auto"
               tickMargin={4}
@@ -489,34 +482,36 @@ function TrendChart({ labels, series, formatYAxisLabel }: TrendChartProps) {
               tickLine={false}
               tick={{ fill: "#657691", fontSize: 11, fontWeight: 600 }}
               tickFormatter={(value) => yLabelFormatter(Number(value))}
-              domain={[0, "auto"]}
+              domain={[0, upperBound ?? "auto"]}
+              allowDataOverflow={hasExtrema}
             />
             <Tooltip
               cursor={{ stroke: "rgba(15, 94, 216, 0.34)", strokeWidth: 1 }}
               wrapperStyle={{ outline: "none" }}
-              content={<TrendTooltipContent series={trendSeries} valueFormatter={yLabelFormatter} />}
+              content={<TrendTooltipContent series={series} valueFormatter={formatTooltipValue ?? yLabelFormatter} />}
             />
 
-            {leadingSeries?.fillColor ? (
+            {areaSeries.map((item, index) => (
               <Area
+                key={index}
                 type="monotone"
-                dataKey={leadingSeries.key}
-                name={leadingSeries.name}
-                stroke={leadingSeries.color}
-                fill={`url(#${gradientId})`}
-                strokeWidth={1.8}
+                dataKey={`${hasExtrema ? "ranges" : "values"}.${index}`}
+                stroke="none"
+                fill={hasExtrema ? item.color : `url(#${gradientId})`}
+                fillOpacity={hasExtrema ? (index === 0 ? 0.14 : 0.1) : undefined}
                 dot={false}
-                activeDot={{ r: 3, stroke: "#ffffff", strokeWidth: 1, fill: leadingSeries.color }}
+                activeDot={false}
                 isAnimationActive={false}
                 connectNulls
               />
-            ) : null}
+            ))}
 
-            {trendSeries.slice(leadingSeries?.fillColor ? 1 : 0).map((item) => (
+            {series.map((item, index) => (
               <Line
-                key={item.key}
+                key={index}
                 type="monotone"
-                dataKey={item.key}
+                dataKey={`values.${index}`}
+                shape={boundary < 0 ? undefined : <IncompleteBucketCurve boundary={boundary} />}
                 name={item.name}
                 stroke={item.color}
                 strokeWidth={1.8}
@@ -740,7 +735,7 @@ export function DashboardPage() {
     queryFn: async () => {
       const window = getTimeWindow(rangeKey);
       const previous = queryClient.getQueryData<DashboardGlobalHistoryData>(["dashboard-global-history", rangeKey]);
-      return getDashboardGlobalHistoryData(window, previous);
+      return { ...await getDashboardGlobalHistoryData(window, previous), sampledAt: Date.parse(window.to) };
     },
     refetchInterval: (query) => {
       const data = query.state.data as
@@ -918,9 +913,9 @@ export function DashboardPage() {
           </div>
           <div>
             <p className="dashboard-kpi-label">{t("实时吞吐")}</p>
-            <p className="dashboard-kpi-value">{formatBps(latestIngress + latestEgress)}</p>
+            <p className="dashboard-kpi-value">{formatBytesPerSecond(latestIngress + latestEgress)}</p>
             <p className="dashboard-kpi-sub">
-              {t("下载")} {formatBps(latestIngress)} · {t("上传")} {formatBps(latestEgress)}
+              {t("下载")} {formatBytesPerSecond(latestIngress)} · {t("上传")} {formatBytesPerSecond(latestEgress)}
             </p>
           </div>
         </Card>
@@ -970,20 +965,24 @@ export function DashboardPage() {
         <Card className="dashboard-panel span-2">
           <div className="dashboard-panel-header">
             <h3>{t("吞吐趋势")}</h3>
-            <p>{t("实时下载 / 上传速率（bps）")}</p>
+            <p>{t("实时下载 / 上传速率（B/s）")}</p>
           </div>
           <TrendChart
             labels={throughputLabels}
-            formatYAxisLabel={formatShortBps}
+            formatYAxisLabel={(value) => formatBytesPerSecond(value, true)}
+            formatTooltipValue={formatBytesPerSecond}
+            aggregationWindowMs={getRangeDurationMs(rangeKey)}
             series={[
               {
                 name: t("下载速率"),
+                tooltipName: t("下载"),
                 values: throughputIngress,
                 color: "#1076ff",
                 fillColor: "rgba(16, 118, 255, 0.14)",
               },
               {
                 name: t("上传速率"),
+                tooltipName: t("上传"),
                 values: throughputEgress,
                 color: "#00a17f",
               },
@@ -1075,6 +1074,7 @@ export function DashboardPage() {
           </div>
           <TrendChart
             labels={requestLabels}
+            incompleteFrom={incompleteBucketStart(requestItems, globalHistoryQuery.data?.sampledAt)}
             formatYAxisLabel={formatShortNumber}
             series={[
               {
@@ -1102,6 +1102,7 @@ export function DashboardPage() {
           </div>
           <TrendChart
             labels={trafficLabels}
+            incompleteFrom={incompleteBucketStart(trafficItems, globalHistoryQuery.data?.sampledAt)}
             formatYAxisLabel={formatShortBytes}
             series={[
               {
@@ -1118,7 +1119,7 @@ export function DashboardPage() {
             ]}
           />
           <div className="dashboard-summary-inline">
-            <span>{t("总流量")} {formatBytes(totalTrafficBytes)}</span>
+            <span>{t("窗口内总流量")} {formatBytes(totalTrafficBytes)}</span>
           </div>
         </Card>
 
@@ -1129,6 +1130,7 @@ export function DashboardPage() {
           </div>
           <TrendChart
             labels={probeLabels}
+            incompleteFrom={incompleteBucketStart(probeItems, globalHistoryQuery.data?.sampledAt)}
             formatYAxisLabel={formatShortNumber}
             series={[
               {
