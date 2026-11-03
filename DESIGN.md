@@ -668,7 +668,7 @@ Resin 内置了 GeoIP 服务，用于支持 Platform 的 RegionFilters 功能。
 $\text{Penalty} = \max\big((1 - \text{HealthScore}) \times \text{HealthPenaltyMs},\ \text{未知惩罚}\big)$
 
 * **已知惩罚**：健康度越低罚得越多，满分节点一分不罚。因此**全健康的机队评分与健康度功能上线前完全一致**。
-* **未知惩罚**：样本数不足 `health_min_samples_for_filter`（默认 8）的节点，健康度初值是 1.0，只看分数的话它会与跑了上千次的老节点平起平坐。因此按"还差几个样本"线性收费：
+* **未知惩罚**：样本数不足 `health_min_samples_for_filter`（默认 5，与 `health_ewma_min_samples` 同线）的节点，健康度初值是 1.0，只看分数的话它会与跑了上千次的老节点平起平坐。因此按"还差几个样本"线性收费：
 
 	$\text{未知惩罚} = \Big(1 - \frac{\text{HealthSamples}}{\text{health\_min\_samples\_for\_filter}}\Big) \times \text{HealthPenaltyMs}$
 
@@ -2566,7 +2566,7 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 * `HealthEwmaWindow`：健康度评分（成功率 EWMA）的有效跨度，`alpha = 1 / window`。默认 20。
 * `HealthEwmaMinSamples`：观测数低于该值时使用更大的 alpha，让新节点快速收敛。默认 5。
 * `HealthPenaltyMs`：健康度对选路打分的最高惩罚，按 `(1 - 成功率) × 该值` 加成。默认 2000。**设为 0 会关闭整个健康惩罚**，包括未测量节点的降权。
-* `HealthFilterThresholdPercent`：成功率低于该值且观测数足够时，不再作为 P2C 候选。默认 40，设为 0 关闭过滤。
+* `HealthFilterThresholdPercent`：成功率低于该值且观测数足够时，不再作为 P2C 候选。默认 50，设为 0 关闭过滤。
 * `HealthMinSamplesForFilter`：过滤与成功率展示所需的观测数。默认 8。样本不足的节点一律放行，只承担打分上的未知惩罚。
 * `CircuitCooldown` / `CircuitMaxCooldown`：熔断后的最短冷却与退避上限。默认 30 秒 / 30 分钟。0 表示禁用冷却。
 * `HealthRecoveryFloorPercent`：熔断关闭时健康度被抬到的地板值，须高于过滤阈值，避免节点凭旧分数立刻被过滤。默认 60。
