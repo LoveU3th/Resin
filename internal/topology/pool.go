@@ -568,6 +568,10 @@ func (p *GlobalNodePool) RecordResult(hash node.Hash, success bool) {
 		return
 	}
 
+	if success {
+		entry.ResetNoIngress()
+	}
+
 	dynamicChanged, circuitStateChanged := p.recordBreaker(entry, success)
 	// A probe result is an unambiguous signal, so it counts in full.
 	p.recordHealth(entry, success, 1)
@@ -606,6 +610,10 @@ func (p *GlobalNodePool) RecordProbeStageResult(hash node.Hash, stage string, su
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
 		return
+	}
+
+	if success {
+		entry.ResetNoIngress()
 	}
 
 	if success || stage == node.PassiveStageConnect {
@@ -718,6 +726,39 @@ func (p *GlobalNodePool) RecordConnDrop(_ string, hash node.Hash) {
 	p.recordHealth(entry, false, p.currentTransferFailureWeight())
 }
 
+// noIngressQuarantineThreshold is how many consecutive zero-ingress tunnels
+// park a node.
+//
+// Two rather than one: a target that is simply down (a closed port, a dead
+// host) makes any node look like this, and a single sample cannot tell that
+// apart from a node that blackholes tunnels. Two in a row from independent
+// picks of a large pool is a much stronger signal.
+const noIngressQuarantineThreshold = 2
+
+// noIngressQuarantineDuration is how long a parked node stays out of routing.
+// Short on purpose: the condition is easy to produce by accident, and the
+// node's health score still carries the longer-term judgement.
+const noIngressQuarantineDuration = 5 * time.Minute
+
+// RecordNoIngressFailure records a tunnel that carried the client's bytes
+// upstream and received nothing back.
+//
+// This is deliberately not routed through recordBreaker: a zero-ingress tunnel
+// can be caused by the target rather than the node, so it must not count
+// toward eviction. Parking the node for a few minutes is the proportionate
+// response — it stops a blackholing node from taking another pick, while a
+// healthy node loses at most a few minutes of traffic.
+func (p *GlobalNodePool) RecordNoIngressFailure(_ string, hash node.Hash) {
+	entry, ok := p.nodes.Load(hash)
+	if !ok {
+		return
+	}
+	if entry.NoIngressStreak.Add(1) < noIngressQuarantineThreshold {
+		return
+	}
+	entry.NoIngressQuarantineUntil.Store(time.Now().Add(noIngressQuarantineDuration).UnixNano())
+}
+
 // RecordPassiveStageResult records traffic feedback for one phase of a request.
 //
 // The breaker always sees the raw result — a failure is a failure regardless of
@@ -734,6 +775,10 @@ func (p *GlobalNodePool) RecordPassiveStageResult(
 	entry, ok := p.nodes.Load(hash)
 	if !ok {
 		return
+	}
+
+	if success {
+		entry.ResetNoIngress()
 	}
 
 	weight := 1.0

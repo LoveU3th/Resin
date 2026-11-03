@@ -147,6 +147,35 @@ func TestChoiceWidth_ScalesWithAcceptableShare(t *testing.T) {
 	}
 }
 
+// A parked node is out even when it has too few samples for the score filter:
+// the "not measured yet" exemption must not reopen a quarantine.
+func TestHealthWeights_QuarantinedNodeIsRejected(t *testing.T) {
+	pool := newRouterTestPool()
+	h, entry := newProvenEntry(t, `{"id":"parked"}`, "203.0.113.80", 8)
+	pool.addEntry(h, entry)
+
+	weights := healthTestWeights()
+	if !weights.allows(pool, h) {
+		t.Fatal("precondition: a proven healthy node must be allowed")
+	}
+	entry.NoIngressQuarantineUntil.Store(time.Now().Add(time.Minute).UnixNano())
+	if weights.allows(pool, h) {
+		t.Fatal("a quarantined node must be rejected")
+	}
+	if !weights.rejects(pool, h) {
+		t.Fatal("rejects must agree with allows for a quarantined node")
+	}
+
+	// Unmeasured and parked: the sample gate exempts it from the score filter,
+	// but it must still stay out of routing.
+	freshH, freshEntry := newProvenEntry(t, `{"id":"parked-fresh"}`, "203.0.113.81", 0)
+	pool.addEntry(freshH, freshEntry)
+	freshEntry.NoIngressQuarantineUntil.Store(time.Now().Add(time.Minute).UnixNano())
+	if weights.allows(pool, freshH) {
+		t.Fatal("the sample gate must not reopen a quarantine")
+	}
+}
+
 // Whichever width is chosen, routing must still return a routable node and
 // never the zero hash.
 func TestRandomRoute_WideDrawStillRoutesInPoorPool(t *testing.T) {

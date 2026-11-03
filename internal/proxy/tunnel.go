@@ -59,6 +59,17 @@ type tunnelRelayResult struct {
 	upstreamErr   error
 }
 
+// upstreamStage values for a CONNECT tunnel. They name the phase a failure was
+// observed in and are surfaced verbatim in the request log, so they are
+// spelled once here rather than in every branch.
+const (
+	upstreamStageConnectUpstreamCopy = "connect_upstream_to_client_copy"
+	upstreamStageConnectClientCopy   = "connect_client_to_upstream_copy"
+	upstreamStageConnectZeroTraffic  = "connect_zero_traffic"
+	upstreamStageConnectNoIngress    = "connect_no_ingress_traffic"
+	upstreamStageConnectNoEgress     = "connect_no_egress_traffic"
+)
+
 type tunnelPumpOptions struct {
 	requireBidirectionalTraffic bool
 	onFirstIngressByte          func()
@@ -354,23 +365,23 @@ func pumpPreparedTunnelReader(
 	case !ingressErrBenign:
 		result.netOK = false
 		result.proxyErr = ErrUpstreamRequestFailed
-		result.upstreamStage = "connect_upstream_to_client_copy"
+		result.upstreamStage = upstreamStageConnectUpstreamCopy
 		result.upstreamErr = ingressResult.err
 	case !egressErrBenign:
 		result.netOK = false
 		result.proxyErr = ErrUpstreamRequestFailed
-		result.upstreamStage = "connect_client_to_upstream_copy"
+		result.upstreamStage = upstreamStageConnectClientCopy
 		result.upstreamErr = egressResult.err
 	case opts.requireBidirectionalTraffic && (ingressResult.n == 0 || egressResult.n == 0):
 		result.netOK = false
 		result.proxyErr = ErrUpstreamRequestFailed
 		switch {
 		case ingressResult.n == 0 && egressResult.n == 0:
-			result.upstreamStage = "connect_zero_traffic"
+			result.upstreamStage = upstreamStageConnectZeroTraffic
 		case ingressResult.n == 0:
-			result.upstreamStage = "connect_no_ingress_traffic"
+			result.upstreamStage = upstreamStageConnectNoIngress
 		default:
-			result.upstreamStage = "connect_no_egress_traffic"
+			result.upstreamStage = upstreamStageConnectNoEgress
 		}
 	}
 	return result

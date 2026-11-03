@@ -71,6 +71,18 @@ type NodeEntry struct {
 	// healthSamples counts observations behind the score, saturating at
 	// MaxUint32. Used to gate cold-start convergence and hard filtering.
 	healthSamples atomic.Uint32
+	// NoIngressStreak counts consecutive CONNECT tunnels that carried the
+	// client's bytes upstream and got nothing back. It is the one failure mode
+	// that a health score alone handles poorly: the node completes the CONNECT
+	// and then blackholes the tunnel, so the request fails with no retry and no
+	// breaker trip until MaxConsecutiveFailures ordinary failures accumulate —
+	// which, with hundreds of nodes, can take a very long time.
+	NoIngressStreak atomic.Int32
+	// NoIngressQuarantineUntil is unix-nano until which the node stays out of
+	// routing because of NoIngressStreak. 0 means "not quarantined". It is
+	// deliberately separate from the circuit breaker: quarantine never changes
+	// CircuitOpenSince, so the breaker's backoff accounting is untouched.
+	NoIngressQuarantineUntil atomic.Int64
 	// Probe-attempt timestamps (unix-nano). These are updated regardless of
 	// probe success/failure, and are used by probe schedulers.
 	LastLatencyProbeAttempt          atomic.Int64
@@ -150,6 +162,24 @@ func (e *NodeEntry) HealthScore() float64 {
 // math.MaxUint32.
 func (e *NodeEntry) HealthSamples() uint32 {
 	return e.healthSamples.Load()
+}
+
+// NoIngressQuarantined reports whether the node is currently parked because
+// consecutive tunnels returned no data at all.
+//
+// now is passed in rather than read here so the routing hot path can reuse one
+// timestamp for a whole comparison instead of taking the clock per candidate.
+func (e *NodeEntry) NoIngressQuarantined(now time.Time) bool {
+	until := e.NoIngressQuarantineUntil.Load()
+	return until != 0 && now.UnixNano() < until
+}
+
+// ResetNoIngress clears the zero-ingress streak and any quarantine. Called on
+// any success signal, from traffic or probes: one working path is enough to
+// say the node is not blackholing.
+func (e *NodeEntry) ResetNoIngress() {
+	e.NoIngressStreak.Store(0)
+	e.NoIngressQuarantineUntil.Store(0)
 }
 
 // ResetHealth restores the score to fully healthy and drops the sample count.

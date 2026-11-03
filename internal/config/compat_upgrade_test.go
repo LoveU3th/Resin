@@ -32,8 +32,8 @@ func TestApplyCompatibilityDefaults_BackfillsNewFields(t *testing.T) {
 	if out.HealthPenaltyMs != 2000 {
 		t.Fatalf("HealthPenaltyMs: got %d, want 2000", out.HealthPenaltyMs)
 	}
-	if out.HealthFilterThresholdPercent != 40 {
-		t.Fatalf("HealthFilterThresholdPercent: got %d, want 40", out.HealthFilterThresholdPercent)
+	if out.HealthFilterThresholdPercent != 50 {
+		t.Fatalf("HealthFilterThresholdPercent: got %d, want 50", out.HealthFilterThresholdPercent)
 	}
 	if out.HealthTransferFailureWeightPercent != 50 {
 		t.Fatalf("HealthTransferFailureWeightPercent: got %d, want 50", out.HealthTransferFailureWeightPercent)

@@ -60,6 +60,12 @@ func (w HealthWeights) allows(pool PoolAccessor, h node.Hash) bool {
 	if !ok || entry == nil {
 		return true
 	}
+	// A parked node is out regardless of its sample count: the quarantine is a
+	// targeted response to repeated zero-ingress tunnels, not a health reading,
+	// so the "too few observations" exemption must not reopen it.
+	if entry.NoIngressQuarantined(time.Now()) {
+		return false
+	}
 	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {
 		return true
 	}
@@ -80,6 +86,9 @@ func (w HealthWeights) rejects(pool PoolAccessor, h node.Hash) bool {
 	entry, ok := pool.GetEntry(h)
 	if !ok || entry == nil {
 		return false
+	}
+	if entry.NoIngressQuarantined(time.Now()) {
+		return true
 	}
 	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {
 		return false

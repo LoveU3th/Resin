@@ -582,6 +582,12 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	}
 	lifecycle.setNetOK(relay.netOK)
 	prepare.session.recordResult(relay.netOK)
+	// The node accepted the tunnel and then returned nothing: the request is
+	// already failed for the caller, so the only thing left to do is make sure
+	// a node that keeps doing this stops being picked.
+	if relay.upstreamStage == upstreamStageConnectNoIngress {
+		recordNoIngressFailureAsync(p.health, prepare.route)
+	}
 }
 
 // shouldRecordForwardCopyFailure decides whether an HTTP response body copy

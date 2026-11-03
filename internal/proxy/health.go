@@ -91,6 +91,29 @@ func recordConnDropAsync(health HealthRecorder, route routing.RouteResult) {
 	}
 }
 
+// noIngressRecorder is implemented by recorders that accept a "the tunnel
+// carried bytes upstream and got nothing back" signal. Optional, like the
+// staged recorder.
+//
+// It is reported in addition to the ordinary failure: that keeps the health
+// score and the breaker consistent with every other failure, while the extra
+// signal is what parks a repeat offender within two tunnels instead of waiting
+// for the breaker's consecutive-failure count to accumulate across a pool of
+// hundreds of nodes.
+type noIngressRecorder interface {
+	RecordNoIngressFailure(platformID string, hash node.Hash)
+}
+
+// recordNoIngressFailureAsync reports a zero-ingress tunnel.
+func recordNoIngressFailureAsync(health HealthRecorder, route routing.RouteResult) {
+	if health == nil {
+		return
+	}
+	if recorder, ok := health.(noIngressRecorder); ok {
+		go recorder.RecordNoIngressFailure(route.PlatformID, route.NodeHash)
+	}
+}
+
 // recordPassiveSlowFailureAsync reports a failure attributable to a slow origin
 // rather than a broken node.
 //
