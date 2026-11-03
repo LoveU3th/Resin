@@ -190,7 +190,7 @@ func randomRoute(
 
 	// Health filtering is best-effort: if no healthy candidate turns up, the
 	// original pick is kept. Routing must never fail because of health.
-	filter := func(h node.Hash, exclude node.Hash) node.Hash {
+	filter := func(h node.Hash, chosen []node.Hash) node.Hash {
 		if health.allows(pool, h) {
 			return h
 		}
@@ -199,7 +199,7 @@ func randomRoute(
 			if !ok {
 				break
 			}
-			if candidate == exclude || candidate == h {
+			if candidate == h || containsHash(chosen, candidate) {
 				continue
 			}
 			if health.allows(pool, candidate) {
@@ -220,57 +220,148 @@ func randomRoute(
 		return h1, nil
 	}
 
-	h1 = filter(h1, node.Zero)
+	h1 = filter(h1, nil)
 
-	// Pick 2nd candidate; best-effort to make it distinct.
-	h2, ok2 := pick()
-	if !ok2 {
-		return h1, nil
+	// Draw the rest of the field. The width adapts to how much of the pool the
+	// health filter accepts: two-choice is right for a healthy fleet, but in a
+	// pool where most nodes are failing, a third and fourth draw is what turns
+	// "one of two bad nodes" into a decent chance of a good one.
+	chosen := []node.Hash{h1}
+	width := choiceWidth(view, pool, health, rng)
+	if width > size {
+		width = size
 	}
-	if h2 == h1 {
-		for i := 0; i < 3; i++ {
-			candidate, ok := pick()
+	for len(chosen) < width {
+		// Best-effort distinctness: a view that keeps handing back nodes
+		// already in the field is simply narrower than requested.
+		var candidate node.Hash
+		found := false
+		for i := 0; i < excludePickAttempts; i++ {
+			h, ok := pick()
 			if !ok {
 				break
 			}
-			if candidate != h1 {
-				h2 = candidate
+			if !containsHash(chosen, h) {
+				candidate = h
+				found = true
 				break
 			}
 		}
-		if h2 == h1 {
-			return h1, nil
+		if !found {
+			break
 		}
+		chosen = append(chosen, filter(candidate, chosen))
 	}
-	h2 = filter(h2, h1)
 
 	// The quick filter draws a few extra candidates and gives up quickly. When
-	// both picks are still rejected the pool is mostly unhealthy, and random
-	// draws are a bad way to find the acceptable minority: scan the view
-	// instead, bounded, and compare among what turns up. If nothing acceptable
-	// exists at all, fall through and compare the rejected pair as before —
-	// health must never turn a routable pool into a failed request.
-	if !health.allows(pool, h1) || !health.allows(pool, h2) {
+	// any pick is still rejected the pool is mostly unhealthy, and random draws
+	// are a bad way to find the acceptable minority: scan the view instead,
+	// bounded, and compare among what turns up. If nothing acceptable exists at
+	// all, fall through and compare the rejected field as before — health must
+	// never turn a routable pool into a failed request.
+	for _, h := range chosen {
+		if health.allows(pool, h) {
+			continue
+		}
 		if candidates := healthyCandidateScan(view, pool, exclude, health); len(candidates) > 0 {
 			return pickStrictCandidate(
 				candidates, rng, plat, stats, pool, targetDomain, authorities, p2cWindow, health,
 			), nil
 		}
+		break
 	}
 
-	// Determine effective latency for comparison.
-	lat1, lat2 := compareLatencies(h1, h2, pool, targetDomain, authorities, p2cWindow)
-
-	// Calculate scores.
-	s1 := calculateScore(h1, lat1, plat, stats, pool, health)
-	s2 := calculateScore(h2, lat2, plat, stats, pool, health)
-
-	// Lower score is better.
-	selected := h2 // favor h2 on tie
-	if s1 < s2 {
-		selected = h1
+	// Lower score is better. The field is reduced pairwise so every comparison
+	// keeps the three-level latency lookup (and its per-node fallback) that the
+	// two-choice path always used. Ties go to the later candidate, as before.
+	best := chosen[0]
+	for _, candidate := range chosen[1:] {
+		latBest, latCandidate := compareLatencies(
+			best, candidate, pool, targetDomain, authorities, p2cWindow,
+		)
+		bestScore := calculateScore(best, latBest, plat, stats, pool, health)
+		candidateScore := calculateScore(candidate, latCandidate, plat, stats, pool, health)
+		if candidateScore <= bestScore {
+			best = candidate
+		}
 	}
-	return selected, nil
+	return best, nil
+}
+
+// Choice width for one pick. Classic power-of-two-choices is two; a pool where
+// most nodes are rejected is exactly where extra draws pay off.
+const (
+	p2cMinChoices = 2
+	p2cMaxChoices = 4
+	// choiceSampleCap bounds the nodes inspected to estimate how much of the
+	// pool the health filter accepts. Sizing the width must not turn every
+	// request into a full view scan.
+	choiceSampleCap = 32
+	// choiceWidenPercent and choiceWidenMorePercent are the acceptable-share
+	// cut points: below the former the width steps to 3, below the latter to 4.
+	choiceWidenPercent     = 60
+	choiceWidenMorePercent = 35
+)
+
+// choiceWidth reports how many distinct candidates one pick should draw.
+//
+// It costs a bounded sample (at most choiceSampleCap health checks) and is
+// skipped entirely when health weighting is switched off, where there is no
+// signal to size the width from.
+func choiceWidth(
+	view platform.ReadOnlyView,
+	pool PoolAccessor,
+	health HealthWeights,
+	rng *rand.Rand,
+) int {
+	if health.FilterThresholdPercent <= 0 || health.MinSamplesForFilter <= 0 {
+		return p2cMinChoices
+	}
+	size := view.Size()
+	if size <= p2cMinChoices {
+		return p2cMinChoices
+	}
+
+	sampled, accepted := 0, 0
+	if size <= choiceSampleCap {
+		view.Range(func(h node.Hash) bool {
+			sampled++
+			if health.allows(pool, h) {
+				accepted++
+			}
+			return true
+		})
+	} else {
+		seen := make(map[node.Hash]struct{}, choiceSampleCap)
+		// The attempt bound keeps a view that keeps returning the same few
+		// nodes from turning the estimate into an open-ended loop.
+		for attempts := 0; sampled < choiceSampleCap && attempts < choiceSampleCap*4; attempts++ {
+			h, ok := view.RandomPick(rng)
+			if !ok {
+				break
+			}
+			if _, dup := seen[h]; dup {
+				continue
+			}
+			seen[h] = struct{}{}
+			sampled++
+			if health.allows(pool, h) {
+				accepted++
+			}
+		}
+	}
+	if sampled == 0 {
+		return p2cMinChoices
+	}
+
+	switch percent := accepted * 100 / sampled; {
+	case percent < choiceWidenMorePercent:
+		return p2cMaxChoices
+	case percent < choiceWidenPercent:
+		return 3
+	default:
+		return p2cMinChoices
+	}
 }
 
 // healthyCandidateScan collects up to healthyScanCap routable, non-excluded
@@ -302,10 +393,17 @@ func healthyCandidateScan(
 }
 
 // compareLatencies determines the latency values for h1 and h2.
-// Implements the 3-level comparison logic:
+// Implements the comparison logic:
 // 1. Target domain present in both and recent.
 // 2. Common authority domains present in both and recent.
-// 3. Fallback to 0 (empty) for both.
+// 3. Per-node fallback: each side keeps whatever it measured on its own.
+//
+// The third step is not "fall back to zero for both", which is what it used to
+// be. A user target is almost never probed on two nodes at once, so the pair
+// almost always reached step 3; returning (0, 0) there made the score ignore
+// latency entirely and pick by lease count. Keeping a one-sided measurement
+// lets the measured node win on merit, and leaves a genuine 0 only where the
+// node really has nothing.
 func compareLatencies(
 	h1, h2 node.Hash,
 	pool PoolAccessor,
@@ -335,12 +433,34 @@ func compareLatencies(
 		return lat1, lat2
 	}
 
-	// 3. Fallback.
-	return 0, 0
+	// 3. Per-node fallback.
+	lat1, _ = nodeLatency(e1, target, authorities, now, window)
+	lat2, _ = nodeLatency(e2, target, authorities, now, window)
+	return lat1, lat2
 }
 
 func isRecent(t time.Time, now time.Time, window time.Duration) bool {
 	return now.Sub(t) <= window
+}
+
+// coldStartLatency stands in for the latency of a node that has no usable
+// measurement for this target.
+//
+// Scoring zero for "unknown" was wrong in the same way as comparing an unknown
+// latency against a measured one: a zero beat every measured node, so the
+// least-known node won and the latency policies stopped meaning anything. A
+// fixed, moderate estimate keeps unmeasured nodes in the running without
+// handing them the pick; the health penalty then charges them for the
+// remaining doubt, and the sample-count gate keeps fresh nodes from being
+// filtered outright.
+const coldStartLatency = 400 * time.Millisecond
+
+// effectiveLatency maps "no measurement" onto a comparable estimate.
+func effectiveLatency(latency time.Duration) time.Duration {
+	if latency > 0 {
+		return latency
+	}
+	return coldStartLatency
 }
 
 // calculateScore computes the score for a node based on platform allocation policy.
@@ -368,22 +488,18 @@ func calculateScore(
 	}
 
 	var score float64
-	if latency <= 0 {
-		// If latency is 0 (empty/incompatible), score = LeaseCount strictly.
+	switch plat.AllocationPolicy {
+	case platform.AllocationPolicyPreferLowLatency:
+		score = float64(effectiveLatency(latency))
+	case platform.AllocationPolicyPreferIdleIP:
+		// This policy is about spreading leases, not latency, so an unknown
+		// latency is not a reason to score the node differently.
 		score = float64(leaseCount)
-	} else {
-		// Policy-based scoring.
-		switch plat.AllocationPolicy {
-		case platform.AllocationPolicyPreferLowLatency:
-			score = float64(latency)
-		case platform.AllocationPolicyPreferIdleIP:
-			score = float64(leaseCount)
-		case platform.AllocationPolicyBalanced:
-			fallthrough
-		default:
-			// (LeaseCount + 1) * Latency
-			score = float64(leaseCount+1) * float64(latency)
-		}
+	case platform.AllocationPolicyBalanced:
+		fallthrough
+	default:
+		// (LeaseCount + 1) * Latency
+		score = float64(leaseCount+1) * float64(effectiveLatency(latency))
 	}
 
 	// Health penalty, applied the same way under every policy. A fully healthy

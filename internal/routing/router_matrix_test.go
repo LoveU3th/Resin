@@ -182,7 +182,11 @@ func TestCompareLatencies_ComparableTargetDomain(t *testing.T) {
 	}
 }
 
-func TestCompareLatencies_IncomparableFallsBackToZero(t *testing.T) {
+// A one-sided measurement must survive the comparison. The old behaviour —
+// zeroing both sides whenever the pair had no shared sample — made the score
+// ignore latency for almost every real request, because a user target is
+// never probed on two nodes at the same time.
+func TestCompareLatencies_KeepsOneSidedMeasurement(t *testing.T) {
 	pool := newRouterTestPool()
 
 	h1, e1 := newRoutableEntry(t, `{"id":"incmp-a"}`, "203.0.113.30")
@@ -200,8 +204,8 @@ func TestCompareLatencies_IncomparableFallsBackToZero(t *testing.T) {
 		nil, // no authority fallback for this matrix case
 		10*time.Minute,
 	)
-	if lat1 != 0 || lat2 != 0 {
-		t.Fatalf("expected incomparable case to fall back to zero latency, got=(%v,%v)", lat1, lat2)
+	if lat1 != 20*time.Millisecond || lat2 != 0 {
+		t.Fatalf("expected the measured side to be kept, got=(%v,%v)", lat1, lat2)
 	}
 }
 

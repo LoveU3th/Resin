@@ -47,6 +47,27 @@ func averageRecentAuthorityLatency(
 	return time.Duration(int64(sum) / count), true
 }
 
+// nodeLatency is a single node's best available latency estimate for a target:
+// the target's own sample when recent, otherwise the average over the probe
+// authorities this node has measured.
+//
+// It exists so a node that has measurements is not treated as "unknown" just
+// because the node it is compared against happens to share no sample with it.
+// Without it, a pair where only one side was measured compares as (0, 0) and
+// the routing decision falls back to lease counts alone.
+func nodeLatency(
+	entry *node.NodeEntry,
+	target string,
+	authorities []string,
+	now time.Time,
+	window time.Duration,
+) (time.Duration, bool) {
+	if latency, ok := lookupRecentDomainLatency(entry, target, now, window); ok {
+		return latency, true
+	}
+	return averageRecentAuthorityLatency(entry, authorities, now, window)
+}
+
 func averageComparableAuthorityLatencies(
 	e1, e2 *node.NodeEntry,
 	authorities []string,
