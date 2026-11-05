@@ -9,7 +9,7 @@ import "time"
 // A config written before this mechanism existed has no schema_version key and
 // reads back as 0, which is exactly what a config written by an old release
 // looks like — so 0 means "predates versioning" rather than "version 0".
-const RuntimeConfigSchemaVersion = 3
+const RuntimeConfigSchemaVersion = 4
 
 // RuntimeConfig holds all hot-updatable global settings.
 // These are persisted in the database and served via GET /system/config.
@@ -34,6 +34,12 @@ type RuntimeConfig struct {
 	MaxLatencyTestInterval          Duration `json:"max_latency_test_interval"`
 	MaxAuthorityLatencyTestInterval Duration `json:"max_authority_latency_test_interval"`
 	MaxEgressTestInterval           Duration `json:"max_egress_test_interval"`
+	// ProbeQuarantineEnabled parks a node that consecutive active probes could
+	// not reach. It needs neither samples nor a health score: a node that
+	// cannot answer the latency probe is not a routing candidate, whatever its
+	// last successful requests say. Switching it off restores the previous
+	// routing behaviour without redeploying.
+	ProbeQuarantineEnabled bool `json:"probe_quarantine_enabled"`
 
 	// Health score: success-ratio EWMA per node.
 	// HealthEwmaWindow is the effective span of the score (alpha = 1/window);
@@ -136,6 +142,7 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		ReverseProxyLogRespBodyMaxBytes:    1024,
 
 		MaxConsecutiveFailures:             3,
+		ProbeQuarantineEnabled:             true,
 		HealthEwmaWindow:                   20,
 		HealthEwmaMinSamples:               5,
 		HealthPenaltyMs:                    2000,
@@ -299,6 +306,17 @@ func applyRuntimeConfigMigrations(cfg *RuntimeConfig) bool {
 		if cfg.FailoverConnectExtraAttempts <= 0 {
 			cfg.FailoverConnectExtraAttempts = defaults.FailoverConnectExtraAttempts
 		}
+	}
+
+	if cfg.SchemaVersion < 4 {
+		// v4: probe quarantine.
+		//
+		// The field is a bool defaulting to true, so a config written before it
+		// existed reads back as false — indistinguishable from an operator
+		// switching it off. It is therefore filled in unconditionally for
+		// older configs. Turning it off after the upgrade persists, because the
+		// version is stamped on the same write.
+		cfg.ProbeQuarantineEnabled = defaults.ProbeQuarantineEnabled
 	}
 
 	cfg.SchemaVersion = RuntimeConfigSchemaVersion

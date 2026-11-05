@@ -2561,6 +2561,7 @@ Resin 支持通过 API (`PATCH /system/config`) 动态调整大部分全局运�
 * `MaxLatencyTestInterval`: 节点最大延迟探测间隔。最小 30 秒。默认 1 小时。
 * `MaxAuthorityLatencyTestInterval`: 权威域名（如 cloudflare.com）的最大延迟探测间隔。最小 30 秒。默认 3 小时。
 * `MaxEgressTestInterval`: 节点出口 IP 探测的最大间隔。最小 30 秒。默认 1 天。
+* `ProbeQuarantineEnabled`: 连续 3 次主动延迟探测都**连不上**节点时，把它挂起 10 分钟，不参与选路；任一次探测成功即恢复。默认 True。判定只用延迟探测（`LatencyTestURL` 返回 2xx），不用出口探测：出口探测读 Cloudflare trace，该目标在部分网络下不可达，实测有一半"出口探测失败"的节点其实能正常应答延迟探测，按出口探测挂起会误杀可用容量。挂起**不进熔断状态机**：`FailureCount` / `CircuitOpenSince` 都不动，也不清空健康分，只是暂时不出现在候选里。设为 False 则完全恢复旧行为。
 
 #### 节点健康度与熔断
 * `HealthEwmaWindow`：健康度评分（成功率 EWMA）的有效跨度，`alpha = 1 / window`。默认 20。

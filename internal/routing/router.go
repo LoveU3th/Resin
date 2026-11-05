@@ -38,6 +38,7 @@ type Router struct {
 	healthPenaltyMs              func() int
 	healthFilterThresholdPercent func() int
 	healthMinSamplesForFilter    func() int
+	probeQuarantineEnabled       func() bool
 	// Sticky strict rebind tuning, all optional: nil leaves the behaviour off.
 	stickyStrictRebindEnabled    func() bool
 	stickyStrictThresholdPercent func() int
@@ -59,6 +60,9 @@ type RouterConfig struct {
 	HealthPenaltyMs              func() int
 	HealthFilterThresholdPercent func() int
 	HealthMinSamplesForFilter    func() int
+	// ProbeQuarantineEnabled rejects nodes that consecutive active probes could
+	// not reach. Optional; nil disables the behaviour.
+	ProbeQuarantineEnabled func() bool
 	// Sticky strict rebind: moves a lease whose node failed to connect into the
 	// healthy pool on the account's next request. All optional; nil leaves the
 	// behaviour off.
@@ -79,6 +83,7 @@ func NewRouter(cfg RouterConfig) *Router {
 		healthPenaltyMs:              cfg.HealthPenaltyMs,
 		healthFilterThresholdPercent: cfg.HealthFilterThresholdPercent,
 		healthMinSamplesForFilter:    cfg.HealthMinSamplesForFilter,
+		probeQuarantineEnabled:       cfg.ProbeQuarantineEnabled,
 		stickyStrictRebindEnabled:    cfg.StickyStrictRebindEnabled,
 		stickyStrictThresholdPercent: cfg.StickyStrictThresholdPercent,
 		stickyStrictFallbackPercent:  cfg.StickyStrictFallbackPercent,
@@ -99,6 +104,9 @@ func (r *Router) healthWeights() HealthWeights {
 	}
 	if r.healthMinSamplesForFilter != nil {
 		w.MinSamplesForFilter = r.healthMinSamplesForFilter()
+	}
+	if r.probeQuarantineEnabled != nil {
+		w.ProbeQuarantineEnabled = r.probeQuarantineEnabled()
 	}
 	return w
 }

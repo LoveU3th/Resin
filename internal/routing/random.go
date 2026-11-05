@@ -48,6 +48,12 @@ type HealthWeights struct {
 	// MinSamplesForFilter gates filtering: a node is never filtered before it
 	// has this many observations, so a fresh node is not dropped on noise.
 	MinSamplesForFilter int
+	// ProbeQuarantineEnabled rejects nodes that consecutive active probes could
+	// not reach. Unlike the health filter it needs no samples and no score: a
+	// node that cannot answer a probe at all is not a candidate, regardless of
+	// what its last successful requests say. Exposed as a switch so the
+	// behaviour can be turned off without redeploying.
+	ProbeQuarantineEnabled bool
 }
 
 // allows reports whether a node is healthy enough to be a routing candidate.
@@ -64,6 +70,9 @@ func (w HealthWeights) allows(pool PoolAccessor, h node.Hash) bool {
 	// targeted response to repeated zero-ingress tunnels, not a health reading,
 	// so the "too few observations" exemption must not reopen it.
 	if entry.NoIngressQuarantined(time.Now()) {
+		return false
+	}
+	if w.ProbeQuarantineEnabled && entry.ProbeQuarantined(time.Now()) {
 		return false
 	}
 	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {
@@ -88,6 +97,9 @@ func (w HealthWeights) rejects(pool PoolAccessor, h node.Hash) bool {
 		return false
 	}
 	if entry.NoIngressQuarantined(time.Now()) {
+		return true
+	}
+	if w.ProbeQuarantineEnabled && entry.ProbeQuarantined(time.Now()) {
 		return true
 	}
 	if entry.HealthSamples() < uint32(w.MinSamplesForFilter) {

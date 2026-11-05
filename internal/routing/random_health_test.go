@@ -920,3 +920,36 @@ func TestRouteRequest_ConcurrentBorrowOnDegradedSticky(t *testing.T) {
 		t.Fatalf("lease moved from %q to %q", before.NodeHash, after.NodeHash)
 	}
 }
+
+// A node parked by failed probes must not be a candidate even though its
+// health score and sample count say it is fine, and the switch must be able to
+// turn that behaviour off without touching the node.
+func TestHealthWeights_ProbeQuarantinedNodeIsRejected(t *testing.T) {
+	pool := newRouterTestPool()
+	h, entry := newProvenEntry(t, `{"id":"parked"}`, "198.51.100.77", 20)
+	for i := 0; i < node.ProbeFailureQuarantineThreshold; i++ {
+		entry.RecordProbeReachability(false)
+	}
+	pool.addEntry(h, entry)
+
+	on := HealthWeights{
+		FilterThresholdPercent: 40,
+		MinSamplesForFilter:    8,
+		ProbeQuarantineEnabled: true,
+	}
+	if on.allows(pool, h) {
+		t.Fatal("a parked node must not be allowed as a candidate")
+	}
+	if !on.rejects(pool, h) {
+		t.Fatal("a parked node must be reported as rejected")
+	}
+
+	off := on
+	off.ProbeQuarantineEnabled = false
+	if !off.allows(pool, h) {
+		t.Fatal("disabling the switch must stop the park from filtering")
+	}
+	if off.rejects(pool, h) {
+		t.Fatal("disabling the switch must stop the park from rejecting")
+	}
+}

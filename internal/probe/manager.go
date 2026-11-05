@@ -414,7 +414,7 @@ func (m *ProbeManager) ProbeLatencySync(hash node.Hash) (*LatencyProbeResult, er
 		m.onProbeEvent("latency")
 	}
 
-	if err := m.performLatencyProbe(hash, testURL); err != nil {
+	if err := m.performLatencyProbe(hash, entry, testURL); err != nil {
 		return nil, fmt.Errorf("latency probe failed: %w", err)
 	}
 
@@ -906,7 +906,7 @@ func (m *ProbeManager) probeLatency(hash node.Hash, entry *node.NodeEntry, testU
 		m.onProbeEvent("latency")
 	}
 
-	if err := m.performLatencyProbe(hash, testURL); err != nil {
+	if err := m.performLatencyProbe(hash, entry, testURL); err != nil {
 		log.Printf("[probe] latency probe failed for %s: %v", hash.Hex(), err)
 		return
 	}
@@ -939,17 +939,34 @@ func (m *ProbeManager) performEgressProbe(hash node.Hash, entry *node.NodeEntry)
 	return ip, egressProbeNoError, nil
 }
 
-func (m *ProbeManager) performLatencyProbe(hash node.Hash, testURL string) error {
+// performLatencyProbe runs one latency probe and reports whether the node is
+// reachable at all.
+//
+// Reachability here drives the probe quarantine, so it deliberately uses this
+// probe and not the egress probe: the egress probe reads a Cloudflare trace,
+// and that endpoint is unreachable from some networks even when the node works.
+// Measured on a live pool, half of the nodes that failed the egress probe still
+// answered this one. Parking them would have removed working capacity.
+//
+// The test URL returns 204 and the fetcher requires a 2xx, so a success means
+// the node completed a real HTTP round trip through its proxy server.
+func (m *ProbeManager) performLatencyProbe(hash node.Hash, entry *node.NodeEntry, testURL string) error {
 	domain := netutil.ExtractDomain(testURL)
 	_, latency, err := m.fetcher(hash, testURL)
 	if err != nil {
 		m.pool.RecordProbeStageResult(hash, probeFailureStage(latency), false)
 		m.pool.RecordLatency(hash, domain, nil)
+		if entry != nil {
+			entry.RecordProbeReachability(false)
+		}
 		return err
 	}
 
 	m.pool.RecordProbeResult(hash, true)
 	m.pool.RecordLatency(hash, domain, &latency)
+	if entry != nil {
+		entry.RecordProbeReachability(true)
+	}
 	return nil
 }
 

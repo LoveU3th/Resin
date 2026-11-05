@@ -549,3 +549,44 @@ func TestHealthScore_ConcurrentSamples(t *testing.T) {
 		t.Fatalf("samples: got %d, want %d (updates were lost)", got, want)
 	}
 }
+
+// A node that cannot answer the probe at all is parked, but only after a
+// streak: one failed probe can be the probe target's fault.
+func TestRecordProbeReachability_ParksAtThresholdAndExpires(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+	now := time.Now()
+
+	for i := 1; i < ProbeFailureQuarantineThreshold; i++ {
+		e.RecordProbeReachability(false)
+		if e.ProbeQuarantined(now) {
+			t.Fatalf("parked after %d failures, want %d", i, ProbeFailureQuarantineThreshold)
+		}
+	}
+
+	e.RecordProbeReachability(false)
+	if !e.ProbeQuarantined(now) {
+		t.Fatal("not parked at the threshold")
+	}
+	if e.ProbeQuarantined(now.Add(ProbeFailureQuarantineDuration + time.Second)) {
+		t.Fatal("still parked after the quarantine expired")
+	}
+}
+
+// One answer clears both the streak and the park: the node is demonstrably up.
+func TestRecordProbeReachability_SuccessClearsQuarantine(t *testing.T) {
+	e := NewNodeEntry(Hash{}, nil, time.Now(), 0)
+	for i := 0; i < ProbeFailureQuarantineThreshold; i++ {
+		e.RecordProbeReachability(false)
+	}
+	if !e.ProbeQuarantined(time.Now()) {
+		t.Fatal("setup: expected the node to be parked")
+	}
+
+	e.RecordProbeReachability(true)
+	if e.ProbeQuarantined(time.Now()) {
+		t.Fatal("success did not clear the park")
+	}
+	if got := e.ProbeFailStreak.Load(); got != 0 {
+		t.Fatalf("streak not reset: got %d", got)
+	}
+}

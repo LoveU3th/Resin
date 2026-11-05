@@ -88,6 +88,7 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"reverse_proxy_log_resp_headers_max_bytes": true,
 	"reverse_proxy_log_resp_body_max_bytes":    true,
 	"max_consecutive_failures":                 true,
+	"probe_quarantine_enabled":                 true,
 	"health_ewma_window":                       true,
 	"health_ewma_min_samples":                  true,
 	"health_penalty_ms":                        true,

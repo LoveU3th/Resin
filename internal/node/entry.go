@@ -83,6 +83,19 @@ type NodeEntry struct {
 	// deliberately separate from the circuit breaker: quarantine never changes
 	// CircuitOpenSince, so the breaker's backoff accounting is untouched.
 	NoIngressQuarantineUntil atomic.Int64
+	// ProbeFailStreak counts consecutive active probes that could not reach
+	// the node at all (connect stage). It drives ProbeQuarantineUntil.
+	//
+	// Not persisted: it is derived state and the next probe re-establishes it.
+	ProbeFailStreak atomic.Int32
+	// ProbeQuarantineUntil is unix-nano until which the node stays out of
+	// routing because active probes keep failing to reach it. 0 means "not
+	// quarantined".
+	//
+	// Deliberately separate from the circuit breaker: a node that cannot be
+	// probed but is still reachable for user traffic should lose picks without
+	// having its breaker accounting touched. See RecordProbeReachability.
+	ProbeQuarantineUntil atomic.Int64
 	// Probe-attempt timestamps (unix-nano). These are updated regardless of
 	// probe success/failure, and are used by probe schedulers.
 	LastLatencyProbeAttempt          atomic.Int64
@@ -180,6 +193,54 @@ func (e *NodeEntry) NoIngressQuarantined(now time.Time) bool {
 func (e *NodeEntry) ResetNoIngress() {
 	e.NoIngressStreak.Store(0)
 	e.NoIngressQuarantineUntil.Store(0)
+}
+
+const (
+	// ProbeFailureQuarantineThreshold is how many consecutive active probes
+	// must fail to reach a node before it is parked.
+	//
+	// Three rather than one: a single failed probe can be the probe target's
+	// fault, and in a large pool keeping a bad node one extra round costs a few
+	// seconds of retries, while parking a working node costs capacity.
+	ProbeFailureQuarantineThreshold = 3
+
+	// ProbeFailureQuarantineDuration is how long a node stays out of routing
+	// once that streak is reached.
+	//
+	// Short on purpose: the same probes that parked the node are what clear it,
+	// and the latency-probe interval is minutes (not the egress refresh
+	// interval, which can be a day). A node that answers the next probe is back
+	// before the quarantine would have expired.
+	ProbeFailureQuarantineDuration = 10 * time.Minute
+)
+
+// RecordProbeReachability folds one active probe's reachability verdict into
+// the probe-quarantine streak.
+//
+// Only connect-stage results belong here. A transfer-stage failure means the
+// node did proxy a connection and the fault lies beyond it, so it must not
+// count toward parking. A single success clears both the streak and any active
+// quarantine: the node answered.
+func (e *NodeEntry) RecordProbeReachability(reachable bool) {
+	if reachable {
+		e.ProbeFailStreak.Store(0)
+		e.ProbeQuarantineUntil.Store(0)
+		return
+	}
+	if e.ProbeFailStreak.Add(1) < ProbeFailureQuarantineThreshold {
+		return
+	}
+	e.ProbeQuarantineUntil.Store(time.Now().Add(ProbeFailureQuarantineDuration).UnixNano())
+}
+
+// ProbeQuarantined reports whether the node is currently parked because
+// consecutive active probes could not reach it.
+//
+// now is passed in so the routing hot path can reuse one timestamp for a whole
+// comparison instead of reading the clock per candidate.
+func (e *NodeEntry) ProbeQuarantined(now time.Time) bool {
+	until := e.ProbeQuarantineUntil.Load()
+	return until != 0 && now.UnixNano() < until
 }
 
 // ResetHealth restores the score to fully healthy and drops the sample count.

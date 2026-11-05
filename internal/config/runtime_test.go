@@ -141,3 +141,36 @@ func TestRuntimeConfig_JSONFieldNames(t *testing.T) {
 		}
 	}
 }
+
+// A config written before v4 reads probe_quarantine_enabled back as false,
+// which is indistinguishable from an operator switching it off. The migration
+// must therefore enable it once, and the stamped version must stop it from
+// happening again.
+func TestApplyCompatibilityDefaults_EnablesProbeQuarantineOnUpgrade(t *testing.T) {
+	cfg := NewDefaultRuntimeConfig()
+	cfg.SchemaVersion = 3
+	cfg.ProbeQuarantineEnabled = false
+
+	got, changed := ApplyCompatibilityDefaults(cfg, nil)
+	if !changed {
+		t.Fatal("expected the upgrade to report a change")
+	}
+	if !got.ProbeQuarantineEnabled {
+		t.Fatal("probe quarantine was not enabled by the v4 migration")
+	}
+	if got.SchemaVersion != RuntimeConfigSchemaVersion {
+		t.Fatalf("schema version not stamped: got %d, want %d", got.SchemaVersion, RuntimeConfigSchemaVersion)
+	}
+}
+
+// After the upgrade stamp, an explicit "off" is the operator's choice and must
+// survive a reload.
+func TestApplyCompatibilityDefaults_KeepsProbeQuarantineOffAfterUpgrade(t *testing.T) {
+	cfg := NewDefaultRuntimeConfig()
+	cfg.ProbeQuarantineEnabled = false
+
+	got, _ := ApplyCompatibilityDefaults(cfg, nil)
+	if got.ProbeQuarantineEnabled {
+		t.Fatal("an explicit off was overwritten on an already-upgraded config")
+	}
+}

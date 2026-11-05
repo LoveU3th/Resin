@@ -169,6 +169,9 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 		HealthMinSamplesForFilter: func() int {
 			return runtimeConfigSnapshot(a.runtimeCfg).HealthMinSamplesForFilter
 		},
+		ProbeQuarantineEnabled: func() bool {
+			return runtimeConfigSnapshot(a.runtimeCfg).ProbeQuarantineEnabled
+		},
 		StickyStrictRebindEnabled: func() bool {
 			return runtimeConfigSnapshot(a.runtimeCfg).StickyStrictRebindEnabled
 		},
